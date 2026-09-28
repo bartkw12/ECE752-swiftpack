@@ -7,7 +7,7 @@ import time
 import numpy as np
 
 # Default benchmark configuration
-DEFAULT_N = 256
+DEFAULT_N = 512
 ALPHA = 1.5
 BETA = 1.2
 
