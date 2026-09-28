@@ -4,7 +4,6 @@
 
 import sys
 import time
- 
 import numpy as np
 
 # Default benchmark configuration
