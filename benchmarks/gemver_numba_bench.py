@@ -55,4 +55,54 @@ def initialize_gemver(n):
     
     return A, u1, v1, u2, v2, w, x, y, z
 
+# ---------------------------------------------------------
+# Baseline 0: Pure Python Naive GEMVER
+# ---------------------------------------------------------
+def gemver_python_0(
+    alpha,
+    beta,
+    A,
+    u1,
+    v1,
+    u2,
+    v2,
+    w,
+    x,
+    y,
+    z,
+):
+    """
+    Direct loop-based translation of the PolyBench GEMVER kernel.
 
+    A, x, and w are modified in place.
+    """
+    n = A.shape[0]
+
+    # Stage 1:
+    # A = A + u1 * v1.T + u2 * v2.T
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = (
+                A[i, j]
+                + u1[i] * v1[j]
+                + u2[i] * v2[j]
+            )
+
+    # Stage 2:
+    # x = x + beta * A.T * y
+    for i in range(n):
+        for j in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+    # Stage 3:
+    # x = x + z
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    # Stage 4:
+    # w = w + alpha * A * x
+    for i in range(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+            
