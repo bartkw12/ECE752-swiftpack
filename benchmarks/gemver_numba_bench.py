@@ -131,6 +131,7 @@ def gemver_numpy_reference(
     A_result = A.copy()
     x_result = x.copy()
     w_result = w.copy()
+
     
     A_result += np.outer(u1, v1) + np.outer(u2, v2)
     x_result += beta * np.dot(A_result.T, y)
@@ -138,5 +139,22 @@ def gemver_numpy_reference(
     w_result += alpha * np.dot(A_result, x_result)
     
     return A_result, x_result, w_result
+
+
+# ---------------------------------------------------------
+# Operation Count
+# ---------------------------------------------------------
+def gemver_flop_count(n):
+    """
+    Approximate floating-point operation count for GEMVER.
+    
+    Stage 1: 4 * N^2
+    Stage 2: 3 * N^2
+    Stage 3: N
+    Stage 4: 3 * N^2
+    
+    Total: 10 * N^2 + N
+    """
+    return 10.0 * (n ** 2) + n
 
 
