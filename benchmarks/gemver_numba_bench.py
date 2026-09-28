@@ -251,3 +251,54 @@ def run_benchmark(vector_size=DEFAULT_N):
     return results
 
 
+# ---------------------------------------------------------
+# Formatting and Output Execution
+# ---------------------------------------------------------
+if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        try:
+            N_input = int(sys.argv[1])
+        
+            if N_input <= 0:
+                raise ValueError
+        
+        except ValueError:
+            print(
+                "Invalid vector size. Using the default "
+                f"N={DEFAULT_N}."
+            )
+            N_input = DEFAULT_N
+    else:
+        N_input = DEFAULT_N
+    
+    print(
+        f"\nRunning GEMVER Pure-Python Baseline "
+        f"for N={N_input}...\n"
+    )
+    
+    benchmark_data = run_benchmark(N_input)
+    
+    header = (
+        f"| {'Baseline Implementation':<25} "
+        f"| {'GFLOP/s':>10} "
+        f"| {'Time (s)':>12} "
+        f"| {'Correct':<8} |"
+    )
+    
+    divider = "-" * len(header)
+    
+    print(divider)
+    print(header)
+    print(divider)
+    
+    for name, gflops, elapsed, is_correct in benchmark_data:
+        status = "PASS" if is_correct else "FAIL"
+        
+        print(
+            f"| {name:<25} "
+            f"| {gflops:10.6f} "
+            f"| {elapsed:12.6f} "
+            f"| {status:<8} |"
+        )
+        
+    print(divider)
