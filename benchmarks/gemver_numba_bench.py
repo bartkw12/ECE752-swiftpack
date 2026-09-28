@@ -158,3 +158,96 @@ def gemver_flop_count(n):
     return 10.0 * (n ** 2) + n
 
 
+# ---------------------------------------------------------
+# Execution and Benchmarking Routine
+# ---------------------------------------------------------
+def run_benchmark(vector_size=DEFAULT_N):
+    (
+        A_initial,
+        u1,
+        v1,
+        u2,
+        v2,
+        w_initial,
+        x_initial,
+        y,
+        z,
+    ) = initialize_gemver(vector_size)
+    
+    # Compute the expected result outside the measured region.
+    A_expected, x_expected, w_expected = gemver_numpy_reference(
+        ALPHA,
+        BETA,
+        A_initial,
+        u1,
+        v1,
+        u2,
+        v2,
+        w_initial,
+        x_initial,
+        y,
+        z,
+    )
+    
+    # Give the baseline fresh arrays because GEMVER modifies them.
+    A_result = A_initial.copy()
+    x_result = x_initial.copy()
+    w_result = w_initial.copy()
+    
+    start = time.perf_counter()
+    
+    gemver_python_0(
+        ALPHA,
+        BETA,
+        A_result,
+        u1,
+        v1,
+        u2,
+        v2,
+        w_result,
+        x_result,
+        y,
+        z,
+    )
+    
+    elapsed = time.perf_counter() - start
+    
+    # Check all three modified outputs.
+    A_correct = np.allclose(
+        A_result,
+        A_expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    
+    x_correct = np.allclose(
+        x_result,
+        x_expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    
+    w_correct = np.allclose(
+        w_result,
+        w_expected,
+        rtol=1e-5,
+        atol=1e-5,
+    )
+    
+    is_correct = A_correct and x_correct and w_correct
+    
+    total_flops = gemver_flop_count(vector_size)
+    gflops = (total_flops / elapsed) / 1e9
+    
+    results = [
+        (
+            "0_python_naive",
+            gflops,
+            elapsed,
+            is_correct,
+        )
+    ]
+    
+    return results
+
+
