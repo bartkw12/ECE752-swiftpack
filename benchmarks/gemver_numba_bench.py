@@ -55,6 +55,7 @@ def initialize_gemver(n):
     
     return A, u1, v1, u2, v2, w, x, y, z
 
+
 # ---------------------------------------------------------
 # Baseline 0: Pure Python Naive GEMVER
 # ---------------------------------------------------------
@@ -105,4 +106,37 @@ def gemver_python_0(
         for j in range(n):
             w[i] = w[i] + alpha * A[i, j] * x[j]
 
-            
+
+# ---------------------------------------------------------
+# NumPy Reference Implementation
+# ---------------------------------------------------------
+def gemver_numpy_reference(
+    alpha,
+    beta,
+    A,
+    u1,
+    v1,
+    u2,
+    v2,
+    w,
+    x,
+    y,
+    z,
+):
+    """
+    NumPy implementation used to produce the expected result.
+    
+    Copies are made because GEMVER updates A, x, and w in place.
+    """
+    A_result = A.copy()
+    x_result = x.copy()
+    w_result = w.copy()
+    
+    A_result += np.outer(u1, v1) + np.outer(u2, v2)
+    x_result += beta * np.dot(A_result.T, y)
+    x_result += z
+    w_result += alpha * np.dot(A_result, x_result)
+    
+    return A_result, x_result, w_result
+
+
