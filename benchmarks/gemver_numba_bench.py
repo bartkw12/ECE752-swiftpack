@@ -1,6 +1,20 @@
 # gemver kernel in Polybench benchmarking
 # Bart Kowal
 # 400089782
+#
+# GEMVER: A = A + u1*v1^T + u2*v2^T,  x = x + beta*A^T*y + z,  w = w + alpha*A*x
+#
+# Unlike matmul (2N^3 FLOPs on 3N^2 data, so every element of A is reused ~N
+# times), each GEMVER stage touches every element of A exactly once. The whole
+# kernel does ~10 FLOPs per element of A while moving it ~4 times (~32 bytes),
+# i.e. ~0.3 FLOP/byte, so GEMVER is memory-bound. Optimizations that create
+# cache reuse (tiling, BLAS sub-blocks) have little to exploit here; what helps
+# is stride-1 access, SIMD on the reductions, fewer passes over A (fusion), and
+# parallelism until memory bandwidth saturates.
+#
+# Correctness uses rtol=atol=1e-5: loop interchange, fastmath and parallel
+# reductions change the floating-point summation order, so results differ from
+# the NumPy reference in the last few bits.
 
 import os
 
@@ -13,13 +27,18 @@ os.environ["OMP_NUM_THREADS"] = "1"
 import sys
 import time
 import matplotlib.pyplot as plt
-from numba import njit
+from numba import njit, prange, get_num_threads, threading_layer
 import numpy as np
 
 # Default benchmark configuration
 DEFAULT_N = 512
 ALPHA = 1.5
 BETA = 1.2
+
+# Block sizes for the tiled baselines (same as the matmul benchmark)
+BLOCK_SIZE = 32
+BLOCK_SIZE_L2 = 128
+BLOCK_SIZE_L1 = 32
 
 # Hardware used for the reported benchmark results
 CPU_NAME = "AMD Ryzen 9 5900X 12-Core Processor"
@@ -172,6 +191,608 @@ def gemver_numba_1(
 
 
 # ---------------------------------------------------------
+# Baseline 2: Loop Order Permutations
+# ---------------------------------------------------------
+# Matmul has one 3-deep nest (6 orders). GEMVER has three 2-deep nests
+# (stages 1, 2, 4), each either ij or ji, giving 8 combinations. The suffix
+# of each name gives the order per stage; 4 representative variants are shown.
+#
+# Expectation / Why: NumPy arrays are row-major, so the inner loop should walk
+# along a row of A. The original code does this in stages 1 and 4 but NOT in
+# stage 2, which reads A[j, i] down a column (stride N * 8 bytes). Swapping
+# stage 2 to ji makes it stride-1 AND turns the dot-product reduction into an
+# axpy (x[i] += c * A[j, i] over i) with no loop-carried dependency, so LLVM
+# can vectorize it even without fastmath. ij_ji_ij should be the fastest;
+# ji_ij_ji makes every stage stride-N and should be the slowest.
+@njit
+def _stage1_ij(A, u1, v1, u2, v2):
+    n = A.shape[0]
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+@njit
+def _stage1_ji(A, u1, v1, u2, v2):
+    n = A.shape[0]
+    for j in range(n):
+        for i in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+@njit
+def _stage2_ij(beta, A, x, y):
+    n = A.shape[0]
+    for i in range(n):
+        for j in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+@njit
+def _stage2_ji(beta, A, x, y):
+    n = A.shape[0]
+    for j in range(n):
+        for i in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+@njit
+def _stage3(x, z):
+    for i in range(x.shape[0]):
+        x[i] = x[i] + z[i]
+
+@njit
+def _stage4_ij(alpha, A, w, x):
+    n = A.shape[0]
+    for i in range(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+@njit
+def _stage4_ji(alpha, A, w, x):
+    n = A.shape[0]
+    for j in range(n):
+        for i in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+@njit
+def gemver_2_ij_ij_ij(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    _stage1_ij(A, u1, v1, u2, v2)
+    _stage2_ij(beta, A, x, y)
+    _stage3(x, z)
+    _stage4_ij(alpha, A, w, x)
+
+@njit
+def gemver_2_ij_ji_ij(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    _stage1_ij(A, u1, v1, u2, v2)
+    _stage2_ji(beta, A, x, y)
+    _stage3(x, z)
+    _stage4_ij(alpha, A, w, x)
+
+@njit
+def gemver_2_ji_ji_ji(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    _stage1_ji(A, u1, v1, u2, v2)
+    _stage2_ji(beta, A, x, y)
+    _stage3(x, z)
+    _stage4_ji(alpha, A, w, x)
+
+@njit
+def gemver_2_ji_ij_ji(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    _stage1_ji(A, u1, v1, u2, v2)
+    _stage2_ij(beta, A, x, y)
+    _stage3(x, z)
+    _stage4_ji(alpha, A, w, x)
+
+
+# ---------------------------------------------------------
+# Baseline 3: Optimization Flags for Backend (ij_ji_ij order)
+# ---------------------------------------------------------
+# Expectation / Why: stage 4 is still a dot-product reduction
+# (w[i] += A[i, j] * x[j] over j). Without fastmath, LLVM must keep the
+# additions in source order, so each add waits ~4 cycles for the previous one.
+# fastmath allows reassociation, so the sum is split across SIMD lanes / FMAs.
+@njit(fastmath=True)
+def gemver_opt_flags_3(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for j in range(n):
+        for i in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+
+# ---------------------------------------------------------
+# Baseline 4: Parallel Loop Versions
+# ---------------------------------------------------------
+# parallel_rows: prange over the outer i loop of every stage. Stage 2 is kept
+# in the original (column-reading) order because then each thread owns its
+# own x[i]. The tempting alternative (prange over j in the stride-1 ji order)
+# is a DATA RACE: every thread would update all of x at the same time.
+#
+# parallel_inner: stage 2 in the stride-1 ji order with prange over the INNER
+# i loop, inside a serial j loop (the same as matmul's parallel_k).
+#
+# Expectation / Why: parallel_rows should beat the serial versions (12 cores),
+# but its stage 2 is still strided. parallel_inner starts a new parallel region
+# for every row j (N of them), each doing only N multiply-adds, so thread
+# synchronization overhead dominates and it is likely slower than serial.
+#
+# Observed (5900X): parallel_inner is ~10x slower than serial at N=512, as
+# expected. parallel_rows beats the naive serial code but NOT the serial
+# fastmath version (Baseline 3). At N=512 the whole kernel takes ~0.1 ms, so
+# the four parallel regions' fork/join cost is significant. At N=4096, A (128 MB)
+# lives in DRAM, and one core with stride-1 access already uses most of the
+# memory bandwidth. More threads cannot fetch A faster, and the strided stage 2
+# wastes the bandwidth that is available.
+@njit(parallel=True, fastmath=True)
+def gemver_parallel_rows_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in prange(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for i in prange(n):
+        for j in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for i in prange(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+@njit(parallel=True, fastmath=True)
+def gemver_parallel_inner_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in prange(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for j in range(n):
+        for i in prange(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for i in prange(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+
+# ---------------------------------------------------------
+# Baseline 5: Blocked (Tiled) Parallel Code
+# ---------------------------------------------------------
+# Stages 1 and 4: prange over row blocks, bs x bs tiles.
+# Stage 2: prange over COLUMN blocks. Each thread walks every row j but only
+# its own strip of columns, so the reads are stride-1 and each thread owns
+# its own slice of x (no race).
+#
+# Expectation / Why: in matmul, tiling keeps A/B/C tiles in cache and reuses
+# them ~bs times. GEMVER has no reuse within a stage, so the tiles
+# themselves buy nothing. The only gain over Baseline 4 comes from the race-free
+# stride-1 parallel stage 2. Expect roughly Baseline 4, not a matmul-sized jump.
+@njit(parallel=True, fastmath=True)
+def gemver_blocked_parallel_5(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    bs = BLOCK_SIZE
+    num_blocks = (n + bs - 1) // bs
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for i in range(i_block, i_end):
+                for j in range(j_block, j_end):
+                    A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for j in range(j_block, j_end):
+                for i in range(i_block, i_end):
+                    x[i] = x[i] + beta * A[j, i] * y[j]
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for i in range(i_block, i_end):
+                for j in range(j_block, j_end):
+                    w[i] = w[i] + alpha * A[i, j] * x[j]
+
+
+# ---------------------------------------------------------
+# Baseline 6: Blocked Parallel using np.dot / np.outer for Sub-blocks
+# ---------------------------------------------------------
+# Expectation / Why: in matmul, np.dot on a tile is a Level-3 BLAS call (gemm)
+# doing bs^3 FLOPs on bs^2 data, so the call overhead pays for itself. Here
+# each tile becomes a Level-2 call (gemv) doing only bs^2 FLOPs on bs^2 data.
+# The tiles are not contiguous (Numba copies them for BLAS), and np.outer / the
+# np.dot result allocate a new temporary for every tile. Expect this to be
+# SLOWER than the plain loops in Baseline 5.
+#
+# Observed (5900X): about the same as Baseline 5, not clearly slower. The
+# per-tile overhead is real, but it is hidden behind the memory traffic of A,
+# which is the same for every blocked variant. Unlike matmul, BLAS gives no
+# speedup here either.
+@njit(parallel=True, fastmath=True)
+def gemver_blocked_np_dot_6(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    bs = BLOCK_SIZE
+    num_blocks = (n + bs - 1) // bs
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            A[i_block:i_end, j_block:j_end] += (
+                np.outer(u1[i_block:i_end], v1[j_block:j_end])
+                + np.outer(u2[i_block:i_end], v2[j_block:j_end])
+            )
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            x[i_block:i_end] += beta * np.dot(
+                A[j_block:j_end, i_block:i_end].T,
+                y[j_block:j_end]
+            )
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            w[i_block:i_end] += alpha * np.dot(
+                A[i_block:i_end, j_block:j_end],
+                x[j_block:j_end]
+            )
+
+
+# ---------------------------------------------------------
+# Baseline 7: Blocked Temp Copy-In / Copy-Out
+# ---------------------------------------------------------
+# Stage 1 copies each A tile into a temp, updates it, and writes it back.
+# Stages 2 and 4 keep the accumulator segment (x or w) in a temp and add
+# every j-block into it before writing it back.
+#
+# Expectation / Why: in matmul the C tile is updated n / bs times, so a
+# private, contiguous copy pays off. In GEMVER each A tile is updated exactly
+# once, so its copy is pure extra memory traffic, and the x/w segments are
+# only bs doubles that already stay in L1. Expect no gain over Baseline 6.
+@njit(parallel=True, fastmath=True)
+def gemver_blocked_temp_copy_7(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    bs = BLOCK_SIZE
+    num_blocks = (n + bs - 1) // bs
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            temp = A[i_block:i_end, j_block:j_end].copy()
+            temp += (
+                np.outer(u1[i_block:i_end], v1[j_block:j_end])
+                + np.outer(u2[i_block:i_end], v2[j_block:j_end])
+            )
+            A[i_block:i_end, j_block:j_end] = temp
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        temp_x = x[i_block:i_end].copy()
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            temp_x += beta * np.dot(
+                A[j_block:j_end, i_block:i_end].T,
+                y[j_block:j_end]
+            )
+        x[i_block:i_end] = temp_x
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        temp_w = w[i_block:i_end].copy()
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            temp_w += alpha * np.dot(
+                A[i_block:i_end, j_block:j_end],
+                x[j_block:j_end]
+            )
+        w[i_block:i_end] = temp_w
+
+
+# ---------------------------------------------------------
+# Baseline 8: Two-Level Blocked Parallel with Temp Copy & np.dot
+# ---------------------------------------------------------
+# Direct port of matmul Baseline 8: L2-sized outer blocks, L1-sized inner
+# blocks, temp copies of the accumulator segment at both levels.
+#
+# Expectation / Why: multi-level blocking keeps a working set resident at each
+# cache level so it can be reused. GEMVER streams each element of A once per
+# stage, so there is nothing to keep resident. This only adds loop and BLAS call
+# overhead: expect equal to or slower than Baseline 7.
+#
+# Observed (5900X): the slowest blocked version at N=512, and roughly equal to
+# the others at N=4096. At N=512 the reason is parallelism, not caching: prange
+# runs over L2 blocks, and n / 128 = 4 blocks means only 4 of the 24 threads
+# get any work. Large blocks reduce the available parallelism.
+@njit(parallel=True, fastmath=True)
+def gemver_two_level_blocked_8(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    l2 = BLOCK_SIZE_L2
+    l1 = BLOCK_SIZE_L1
+    num_l2_blocks = (n + l2 - 1) // l2
+
+    for b2 in prange(num_l2_blocks):
+        i2_start = b2 * l2
+        i2_end = min(i2_start + l2, n)
+        for j2_start in range(0, n, l2):
+            j2_end = min(j2_start + l2, n)
+            for i1_start in range(i2_start, i2_end, l1):
+                i1_end = min(i1_start + l1, i2_end)
+                for j1_start in range(j2_start, j2_end, l1):
+                    j1_end = min(j1_start + l1, j2_end)
+                    A[i1_start:i1_end, j1_start:j1_end] += (
+                        np.outer(u1[i1_start:i1_end], v1[j1_start:j1_end])
+                        + np.outer(u2[i1_start:i1_end], v2[j1_start:j1_end])
+                    )
+
+    for b2 in prange(num_l2_blocks):
+        i2_start = b2 * l2
+        i2_end = min(i2_start + l2, n)
+        temp_l2 = x[i2_start:i2_end].copy()
+        for j2_start in range(0, n, l2):
+            j2_end = min(j2_start + l2, n)
+            for i1_start in range(i2_start, i2_end, l1):
+                i1_end = min(i1_start + l1, i2_end)
+                i1_rel_start = i1_start - i2_start
+                i1_rel_end = i1_end - i2_start
+                temp_l1 = temp_l2[i1_rel_start:i1_rel_end].copy()
+                for j1_start in range(j2_start, j2_end, l1):
+                    j1_end = min(j1_start + l1, j2_end)
+                    temp_l1 += beta * np.dot(
+                        A[j1_start:j1_end, i1_start:i1_end].T,
+                        y[j1_start:j1_end]
+                    )
+                temp_l2[i1_rel_start:i1_rel_end] = temp_l1
+        x[i2_start:i2_end] = temp_l2
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for b2 in prange(num_l2_blocks):
+        i2_start = b2 * l2
+        i2_end = min(i2_start + l2, n)
+        temp_l2 = w[i2_start:i2_end].copy()
+        for j2_start in range(0, n, l2):
+            j2_end = min(j2_start + l2, n)
+            for i1_start in range(i2_start, i2_end, l1):
+                i1_end = min(i1_start + l1, i2_end)
+                i1_rel_start = i1_start - i2_start
+                i1_rel_end = i1_end - i2_start
+                temp_l1 = temp_l2[i1_rel_start:i1_rel_end].copy()
+                for j1_start in range(j2_start, j2_end, l1):
+                    j1_end = min(j1_start + l1, j2_end)
+                    temp_l1 += alpha * np.dot(
+                        A[i1_start:i1_end, j1_start:j1_end],
+                        x[j1_start:j1_end]
+                    )
+                temp_l2[i1_rel_start:i1_rel_end] = temp_l1
+        w[i2_start:i2_end] = temp_l2
+
+
+# ---------------------------------------------------------
+# Baseline 9: Zero Allocation Blocked GEMVER
+# ---------------------------------------------------------
+# Same blocking as Baselines 6/7, but with no np.outer, no np.dot and no
+# temporary arrays inside the tile loops. Each prange iteration allocates one
+# bs-length accumulator once and reuses it for every j-block.
+#
+# Expectation / Why: this isolates what Baselines 6-8 were paying for:
+# per-tile allocations and small BLAS calls. It should be much faster than
+# 6-8, but it cannot beat Baseline 5 by much, because the memory traffic
+# over A is unchanged.
+#
+# Observed (5900X): only faster than Baseline 8, and within noise of 5-7.
+# Allocation and BLAS call overhead were not the bottleneck. Every blocked
+# variant moves the same bytes of A, and that is what sets the time.
+@njit(parallel=True, fastmath=True)
+def gemver_blocked_zero_alloc_9(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    bs = BLOCK_SIZE
+    num_blocks = (n + bs - 1) // bs
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for i in range(i_block, i_end):
+                a1 = u1[i]
+                a2 = u2[i]
+                for j in range(j_block, j_end):
+                    A[i, j] = A[i, j] + a1 * v1[j] + a2 * v2[j]
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        h = i_end - i_block
+
+        acc_tile = np.empty(bs, dtype=A.dtype)
+        acc = acc_tile[:h]
+        for ii in range(h):
+            acc[ii] = x[i_block + ii]
+
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for j in range(j_block, j_end):
+                c = beta * y[j]
+                for ii in range(h):
+                    acc[ii] += c * A[j, i_block + ii]
+
+        for ii in range(h):
+            x[i_block + ii] = acc[ii]
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        h = i_end - i_block
+
+        acc_tile = np.empty(bs, dtype=A.dtype)
+        acc = acc_tile[:h]
+        acc.fill(0.0)
+
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for ii in range(h):
+                s = 0.0
+                for j in range(j_block, j_end):
+                    s += A[i_block + ii, j] * x[j]
+                acc[ii] += s
+
+        for ii in range(h):
+            w[i_block + ii] = w[i_block + ii] + alpha * acc[ii]
+
+
+# ---------------------------------------------------------
+# Baseline 10: Reference NumPy (BLAS)
+# ---------------------------------------------------------
+# Expectation / Why: stages 2 and 4 are single BLAS gemv calls, which are well
+# optimized (single-threaded here, see the *_NUM_THREADS settings). Stage 1
+# builds two full N x N np.outer temporaries and then adds them, which is about
+# 3x the memory traffic of the fused in-place loop. Serves as a ceiling for
+# the serial Numba versions and a floor for the parallel ones.
+#
+# Observed (5900X): SLOWER than even the naive Numba loop (~1.4 GFLOP/s at
+# both N). The BLAS calls are fast, but stage 1 allocates and fills two N x N
+# temporaries plus their sum (3 x 128 MB at N=4096, with the page faults of
+# fresh memory). For a memory-bound kernel, extra temporaries cost more than
+# BLAS saves.
+def gemver_numpy_10(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    A += np.outer(u1, v1) + np.outer(u2, v2)
+    x += beta * np.dot(A.T, y)
+    x += z
+    w += alpha * np.dot(A, x)
+
+
+# ---------------------------------------------------------
+# Baseline 11: Fused Stage 1 + Stage 2 with fastmath (GEMVER-specific)
+# ---------------------------------------------------------
+# The row-major version of PolyBench's Pluto fusion (kernel_pluto): while each
+# row of A is being updated (stage 1), use it immediately to update x
+# (stage 2, ji order). Stage 4 cannot be fused because it needs the final x.
+# Stage 4 accumulates in a scalar and applies alpha once per row.
+#
+# Expectation / Why: A now streams through the memory hierarchy 3 times
+# (read+write in the fused sweep, read in stage 4) instead of 4. At N=512 A
+# (2 MB) sits in L3, so the gain is small; at large N (A in DRAM) it should
+# approach the ~25% traffic reduction.
+#
+# Observed (5900X): within noise of Baseline 3 at N=512, and ~15% faster at
+# N=4096 (16.2 ms vs 18.9 ms). Fusion only pays once A no longer fits in cache.
+@njit(fastmath=True)
+def gemver_fused_11(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        a1 = u1[i]
+        a2 = u2[i]
+        c = beta * y[i]
+        for j in range(n):
+            a = A[i, j] + a1 * v1[j] + a2 * v2[j]
+            A[i, j] = a
+            x[j] += c * a
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        s = 0.0
+        for j in range(n):
+            s += A[i, j] * x[j]
+        w[i] = w[i] + alpha * s
+
+
+# ---------------------------------------------------------
+# Baseline 12: Fused + Parallel (GEMVER-specific)
+# ---------------------------------------------------------
+# Baseline 11 with the fused sweep split into one chunk of rows per thread.
+# Every thread's rows contribute to ALL of x, so each thread accumulates into
+# its own private row of `partial`, and the partials are then added together
+# (fused with stage 3). Stage 4 is a parallel loop over rows.
+#
+# Expectation / Why: combines stride-1 access, SIMD (fastmath), fewer passes
+# over A (fusion) and all cores. Expected to be the fastest Numba version; at
+# large N it should approach the DRAM bandwidth limit.
+#
+# Observed (5900X): fastest at N=4096 (13.5 ms, ~1.4x over serial Baseline 3),
+# but tied with 3/11 at N=512. 24 threads give only ~1.4x because the kernel
+# already runs close to the dual-channel DDR4 bandwidth (~30 GB/s effective).
+# For a memory-bound kernel, the ceiling is bandwidth, not core count.
+@njit(parallel=True, fastmath=True)
+def gemver_fused_parallel_12(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    num_chunks = get_num_threads()
+    chunk = (n + num_chunks - 1) // num_chunks
+    partial = np.zeros((num_chunks, n), dtype=A.dtype)
+
+    for t in prange(num_chunks):
+        row_start = t * chunk
+        row_end = min(row_start + chunk, n)
+        for i in range(row_start, row_end):
+            a1 = u1[i]
+            a2 = u2[i]
+            c = beta * y[i]
+            for j in range(n):
+                a = A[i, j] + a1 * v1[j] + a2 * v2[j]
+                A[i, j] = a
+                partial[t, j] += c * a
+
+    for j in prange(n):
+        s = x[j]
+        for t in range(num_chunks):
+            s += partial[t, j]
+        x[j] = s + z[j]
+
+    for i in prange(n):
+        s = 0.0
+        for j in range(n):
+            s += A[i, j] * x[j]
+        w[i] = w[i] + alpha * s
+
+
+# ---------------------------------------------------------
 # NumPy Reference Implementation
 # ---------------------------------------------------------
 def gemver_numpy_reference(
@@ -196,11 +817,7 @@ def gemver_numpy_reference(
     x_result = x.copy()
     w_result = w.copy()
 
-
-    A_result += np.outer(u1, v1) + np.outer(u2, v2)
-    x_result += beta * np.dot(A_result.T, y)
-    x_result += z
-    w_result += alpha * np.dot(A_result, x_result)
+    gemver_numpy_10(alpha, beta, A_result, u1, v1, u2, v2, w_result, x_result, y, z)
 
     return A_result, x_result, w_result
 
@@ -299,6 +916,21 @@ def run_benchmark(vector_size=DEFAULT_N):
     # Baseline functions list
     functions = [
         ("1_numba_naive", gemver_numba_1),
+        ("2_order_ij_ij_ij", gemver_2_ij_ij_ij),
+        ("2_order_ij_ji_ij", gemver_2_ij_ji_ij),
+        ("2_order_ji_ji_ji", gemver_2_ji_ji_ji),
+        ("2_order_ji_ij_ji", gemver_2_ji_ij_ji),
+        ("3_fastmath_ij_ji_ij", gemver_opt_flags_3),
+        ("4_parallel_rows", gemver_parallel_rows_4),
+        ("4_parallel_inner", gemver_parallel_inner_4),
+        ("5_blocked_parallel", gemver_blocked_parallel_5),
+        ("6_blocked_np_dot", gemver_blocked_np_dot_6),
+        ("7_blocked_temp_copy", gemver_blocked_temp_copy_7),
+        ("8_two_level_blocked", gemver_two_level_blocked_8),
+        ("9_blocked_zero_alloc", gemver_blocked_zero_alloc_9),
+        ("10_numpy", gemver_numpy_10),
+        ("11_fused_fastmath", gemver_fused_11),
+        ("12_fused_parallel", gemver_fused_parallel_12),
     ]
 
     for name, fn in functions:
@@ -329,15 +961,19 @@ if __name__ == "__main__":
         N_input = DEFAULT_N
 
     print(f"\nRunning GEMVER Benchmarks for N={N_input}...")
-    print(f"CPU: {CPU_NAME}\n")
+    print(f"CPU: {CPU_NAME}")
+    print(f"Numba threads: {get_num_threads()}\n")
 
     benchmark_data = run_benchmark(N_input)
+
+    # The threading layer is only chosen once a parallel function has run.
+    print(f"Numba threading layer: {threading_layer()}\n")
 
     py_elapsed = benchmark_data[0][2]  # Reference execution time for pure Python naive
 
     # Table Header Formatting
     header = (
-        f"| {'Baseline Implementation':<25} "
+        f"| {'Baseline Implementation':<28} "
         f"| {'GFLOP/s':>10} "
         f"| {'Time (s)':>12} "
         f"| {'Abs Speedup':>12} "
@@ -359,7 +995,7 @@ if __name__ == "__main__":
         status = "PASS" if is_correct else "FAIL"
 
         print(
-            f"| {name:<25} "
+            f"| {name:<28} "
             f"| {gflops:10.4f} "
             f"| {elapsed:12.6f} "
             f"| {abs_speedup:11.2f}x "
@@ -389,7 +1025,7 @@ if __name__ == "__main__":
         )
 
     plt.ylabel("GFLOP/s (Higher is better)")
-    plt.title(f"Numba GEMVER Benchmark Performance (N={N_input})\nCPU: {CPU_NAME}")
+    plt.title(f"Numba GEMVER Benchmark Performance (N={N_input})\nCPU: {CPU_NAME} | Numba threads: {get_num_threads()}")
     plt.xticks(rotation=45, ha="right")
     plt.yscale("log")
     plt.grid(True, which="both", ls="--", alpha=0.5)
