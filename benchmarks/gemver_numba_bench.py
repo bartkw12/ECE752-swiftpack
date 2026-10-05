@@ -41,7 +41,10 @@ BLOCK_SIZE_L2 = 128
 BLOCK_SIZE_L1 = 32
 
 # Hardware used for the reported benchmark results
-CPU_NAME = "AMD Ryzen 9 5900X 12-Core Processor"
+CPU_NAME = "AMD Ryzen 9 5900X 12-Core Processor @ 4.55 GHz"
+L1_cache = "768 KB"
+L2_cache = "6.0 MB"
+L3_cache = "64.0 MB"
 
 # ---------------------------------------------------------
 # Input Initialization
