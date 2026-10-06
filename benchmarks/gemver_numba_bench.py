@@ -438,19 +438,13 @@ def gemver_blocked_parallel_5(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
-# Baseline 6: Blocked Parallel using np.dot / np.outer for Sub-blocks
+# Baseline 6: Blocked with np.dot / np.outer
+# - Replaces inner tile loops with NumPy/BLAS-style operations.
+        # - NumPy vs. Numba-compiled scalar loops
+# - np.outer handles rank-1 tile updates; np.dot handles matrix-vector tile work.
+# - Non-contiguous transposed tiles trigger the Numba performance warning.
+# - Small calls and temporary arrays offset the benefit of optimized library routines.
 # ---------------------------------------------------------
-# Expectation / Why: in matmul, np.dot on a tile is a Level-3 BLAS call (gemm)
-# doing bs^3 FLOPs on bs^2 data, so the call overhead pays for itself. Here
-# each tile becomes a Level-2 call (gemv) doing only bs^2 FLOPs on bs^2 data.
-# The tiles are not contiguous (Numba copies them for BLAS), and np.outer / the
-# np.dot result allocate a new temporary for every tile. Expect this to be
-# SLOWER than the plain loops in Baseline 5.
-#
-# Observed (5900X): about the same as Baseline 5, not clearly slower. The
-# per-tile overhead is real, but it is hidden behind the memory traffic of A,
-# which is the same for every blocked variant. Unlike matmul, BLAS gives no
-# speedup here either.
 @njit(parallel=True, fastmath=True)
 def gemver_blocked_np_dot_6(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
@@ -490,18 +484,19 @@ def gemver_blocked_np_dot_6(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
                 x[j_block:j_end]
             )
 
+# potential disadvantage
+# Each np.outer() creates a temporary tile. Baseline 5 updates A directly.
+# operations are small, some inputs are non-contiguous, 
+# and temporary arrays are created, so NumPy does not produce a major speedup.
+
 
 # ---------------------------------------------------------
-# Baseline 7: Blocked Temp Copy-In / Copy-Out
+# Baseline 7: Blocked Temporary Copies
+# - Copies A tiles and x/w segments into contiguous temporary arrays.
+# - Updates each temporary, then writes the result back.
+# - Result: 0.311 ms at N=512; slightly slower than Baseline 6 at N=4096.
+# - Extra copies add memory traffic, while GEMVER does not reuse each tile enough to recover the cost.
 # ---------------------------------------------------------
-# Stage 1 copies each A tile into a temp, updates it, and writes it back.
-# Stages 2 and 4 keep the accumulator segment (x or w) in a temp and add
-# every j-block into it before writing it back.
-#
-# Expectation / Why: in matmul the C tile is updated n / bs times, so a
-# private, contiguous copy pays off. In GEMVER each A tile is updated exactly
-# once, so its copy is pure extra memory traffic, and the x/w segments are
-# only bs doubles that already stay in L1. Expect no gain over Baseline 6.
 @njit(parallel=True, fastmath=True)
 def gemver_blocked_temp_copy_7(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
@@ -546,6 +541,11 @@ def gemver_blocked_temp_copy_7(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
                 x[j_block:j_end]
             )
         w[i_block:i_end] = temp_w
+
+# baseline 7:
+# A tests whether copying a matrix tile into contiguous storage helps tile processing.
+# x and w test whether keeping partial accumulations local reduces repeated loads and stores.
+# Result: slower because extra copy traffic outweighs any locality benefit.
 
 
 # ---------------------------------------------------------
