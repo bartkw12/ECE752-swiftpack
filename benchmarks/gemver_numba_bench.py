@@ -1118,6 +1118,19 @@ def run_benchmark(vector_size=DEFAULT_N):
 # the memory system is saturated. Expect the curves to flatten after a few
 # threads at large N (A in DRAM), no gain from 24 logical threads over 12
 # physical cores, and better scaling when A fits in L3.
+#
+# Observed (5900X), N=4096:
+#   12_fused_parallel peaks at 2-4 threads (only ~1.25x over its own 1-thread
+#   run, ~1.4x over serial Baseline 11) and then DROPS back to ~1.0x at 24
+#   threads: once memory is saturated, more threads only add contention.
+#   4_parallel_rows scales best (~4.8x) but only because its 1-thread run is
+#   slow: its strided stage 2 waits on cache misses, and several threads can
+#   wait at once. It flattens at 12 threads (24 adds nothing) and never reaches
+#   serial Baseline 11. Good scaling is not the same as good performance.
+#   5_blocked_parallel flattens at ~2x by 6 threads.
+# Observed (5900X), N=1024 (A = 8 MB, fits in L3): the kernel takes under 1 ms
+#   and the results are not stable between runs (12_fused_parallel at 12 threads
+#   measured both 1.2x and 2.7x), so no scaling conclusion is drawn at this size.
 THREAD_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24]
 
 def run_thread_sweep(vector_size=DEFAULT_N):
@@ -1296,7 +1309,7 @@ def report_thread_sweep(vector_size):
         ax.set_xticks(thread_counts)
         ax.set_xlabel("Numba threads")
         ax.grid(True, ls="--", alpha=0.3)
-        ax.legend(loc="lower right")
+        ax.legend(loc="best")
 
     fig.suptitle(f"Numba GEMVER Thread-Count Sweep (N={vector_size})\nCPU: {CPU_NAME}")
     plt.tight_layout()
@@ -1322,6 +1335,11 @@ if __name__ == "__main__":
             N_input = DEFAULT_N
     else:
         N_input = DEFAULT_N
+
+    # Optional second argument selects a sweep instead of the baseline table.
+    if len(sys.argv) > 2 and sys.argv[2] == "threads":
+        report_thread_sweep(N_input)
+        sys.exit(0)
 
     print(f"\nRunning GEMVER Benchmarks for N={N_input}...")
     print(f"CPU: {CPU_NAME}")
