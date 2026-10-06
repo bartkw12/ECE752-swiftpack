@@ -812,6 +812,14 @@ def gemver_fused_parallel_12(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # Baseline 3, the fastmath variant spends ~120 ms extra at N=4096, i.e. the
 # transposed copy alone costs about as much as the whole naive kernel. The
 # improved locality of stage 2 does not come close to paying for building AT.
+
+# ---------------------------------------------------------
+# Baseline 13: Pre-Transposed A
+# - Builds a contiguous AT after stage 1 so stage 2 can read rows with stride-1 access.
+# - Tests both normal and fastmath versions.
+# - Compiler/memory trade-off: simpler contiguous reduction, but an extra N x N copy is required.
+# - Expected to beat the naive strided form but lose to loop interchange, which needs no copy.
+# ---------------------------------------------------------
 @njit
 def gemver_pretranspose_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
