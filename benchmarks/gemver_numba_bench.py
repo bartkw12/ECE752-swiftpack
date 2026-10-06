@@ -297,10 +297,10 @@ def gemver_2_ji_ij_ji(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # ---------------------------------------------------------
 # Baseline 3: Optimization Flags for Backend (ij_ji_ij order)
 # ---------------------------------------------------------
-# Expectation / Why: stage 4 is still a dot-product reduction
-# (w[i] += A[i, j] * x[j] over j). Without fastmath, LLVM must keep the
-# additions in source order, so each add waits ~4 cycles for the previous one.
-# fastmath allows reassociation, so the sum is split across SIMD lanes / FMAs.
+# - Adds @njit(fastmath=True) to ij_ji_ij.
+# - Lets LLVM reassociate floating-point reductions and use SIMD/FMA more freely.
+# - Trade-off: tiny floating-point differences are possible.
+# ---------------------------------------------------------
 @njit(fastmath=True)
 def gemver_opt_flags_3(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
