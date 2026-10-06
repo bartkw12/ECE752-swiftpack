@@ -859,6 +859,89 @@ def gemver_pretranspose_fastmath_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
+# Baseline 14: Local Scalar Accumulators (GEMVER-specific)
+# ---------------------------------------------------------
+# In the dot-product loops, keep x[i] / w[i] in a local variable and store it
+# once after the inner loop, instead of loading and storing the array element
+# on every iteration. The arithmetic is otherwise unchanged.
+#   scalar_acc_naive:    original order, scalars in stage 2 and stage 4
+#   scalar_acc_ij_ji_ij: best order, scalar in stage 4 only (stage 2 is an
+#                        axpy over x there, so there is nothing to accumulate)
+#   scalar_acc_fastmath: scalar_acc_ij_ji_ij with fastmath
+#
+# Expectation / Why: Numba cannot prove that w (or x) does not overlap A, so
+# "w[i] = w[i] + ..." may store and reload w[i] every iteration, which puts a
+# store-to-load forward on top of the add in the dependency chain. A local
+# scalar stays in a register. Expect a gain over Baseline 1 and over
+# 2_order_ij_ji_ij (no fastmath), and little or none over Baseline 3, where
+# the loop is already vectorized.
+@njit
+def gemver_scalar_acc_naive_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for i in range(n):
+        s = x[i]
+        for j in range(n):
+            s = s + beta * A[j, i] * y[j]
+        x[i] = s
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        s = w[i]
+        for j in range(n):
+            s = s + alpha * A[i, j] * x[j]
+        w[i] = s
+
+@njit
+def gemver_scalar_acc_ij_ji_ij_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for j in range(n):
+        for i in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        s = w[i]
+        for j in range(n):
+            s = s + alpha * A[i, j] * x[j]
+        w[i] = s
+
+@njit(fastmath=True)
+def gemver_scalar_acc_fastmath_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    for j in range(n):
+        for i in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        s = w[i]
+        for j in range(n):
+            s = s + alpha * A[i, j] * x[j]
+        w[i] = s
+
+
+# ---------------------------------------------------------
 # NumPy Reference Implementation
 # ---------------------------------------------------------
 def gemver_numpy_reference(
