@@ -809,6 +809,12 @@ def gemver_fused_parallel_12(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # the same stride-1 access with no copy. Expect faster than naive (the strided
 # pass is now a simple copy, not a dependent reduction) but slower than
 # 2_order_ij_ji_ij / Baseline 3.
+#
+# Observed (5900X): SLOWER than even the naive Baseline 1 (1.3 ms vs 0.9 ms at
+# N=512, 154 ms vs 116 ms at N=4096), and fastmath barely helps. Compared with
+# Baseline 3, the fastmath variant spends ~120 ms extra at N=4096, i.e. the
+# transposed copy alone costs about as much as the whole naive kernel. The
+# improved locality of stage 2 does not come close to paying for building AT.
 @njit
 def gemver_pretranspose_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
@@ -991,6 +997,8 @@ def run_benchmark(vector_size=DEFAULT_N):
         ("10_numpy", gemver_numpy_10),
         ("11_fused_fastmath", gemver_fused_11),
         ("12_fused_parallel", gemver_fused_parallel_12),
+        ("13_pretranspose", gemver_pretranspose_13),
+        ("13_pretranspose_fastmath", gemver_pretranspose_fastmath_13),
     ]
 
     for name, fn in functions:
