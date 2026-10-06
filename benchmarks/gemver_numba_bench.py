@@ -690,24 +690,24 @@ def gemver_blocked_zero_alloc_9(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
-# Baseline 10: Reference NumPy (BLAS)
+# Baseline 10: NumPy Reference
+# - Expresses GEMVER with np.outer and np.dot; external BLAS is forced to one thread.
+# - Provides a concise reference implementation and expected output.
+# - Result: 1.75 ms at N=512; 115 ms at N=4096.
+# - Stage 1 creates large temporary matrices, which adds significant memory traffic.
 # ---------------------------------------------------------
-# Expectation / Why: stages 2 and 4 are single BLAS gemv calls, which are well
-# optimized (single-threaded here, see the *_NUM_THREADS settings). Stage 1
-# builds two full N x N np.outer temporaries and then adds them, which is about
-# 3x the memory traffic of the fused in-place loop. Serves as a ceiling for
-# the serial Numba versions and a floor for the parallel ones.
-#
-# Observed (5900X): SLOWER than even the naive Numba loop (~1.4 GFLOP/s at
-# both N). The BLAS calls are fast, but stage 1 allocates and fills two N x N
-# temporaries plus their sum (3 x 128 MB at N=4096, with the page faults of
-# fresh memory). For a memory-bound kernel, extra temporaries cost more than
-# BLAS saves.
+
 def gemver_numpy_10(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     A += np.outer(u1, v1) + np.outer(u2, v2)
     x += beta * np.dot(A.T, y)
     x += z
     w += alpha * np.dot(A, x)
+
+# stages 2 and 4 are single BLAS gemv calls, which are well
+# optimized (single-threaded here, see the *_NUM_THREADS settings). Stage 1
+# builds two full N x N np.outer temporaries and then adds them, which is about
+# 3x the memory traffic of the fused in-place loop. Serves as a ceiling for
+# the serial Numba versions and a floor for the parallel ones.
 
 
 # ---------------------------------------------------------
