@@ -203,20 +203,18 @@ def gemver_numba_1(
 
 # ---------------------------------------------------------
 # Baseline 2: Loop Order Permutations
+# - Tests ij/ji orders for stages 1, 2, and 4 (these are the only loops)
+# - Best order is ij_ji_ij: stage 2 walks A[j, i] across a row with stride-1 access.
+# - Stage 2 updates consecutive elements of x using one row of A.
+# - The operations are independent, so LLVM can use SIMD to process multiple elements at once.
+# - Poor ji orders traverse columns of row-major A and lose cache locality.
 # ---------------------------------------------------------
-# Matmul has one 3-deep nest (6 orders). GEMVER has three 2-deep nests
-# (stages 1, 2, 4), each either ij or ji, giving 8 combinations. The suffix
-# of each name gives the order per stage; 4 representative variants are shown.
-#
-# Expectation / Why: NumPy arrays are row-major, so the inner loop should walk
-# along a row of A. The original code does this in stages 1 and 4 but NOT in
-# stage 2, which reads A[j, i] down a column (stride N * 8 bytes). Swapping
-# stage 2 to ji makes it stride-1 AND turns the dot-product reduction into an
-# axpy (x[i] += c * A[j, i] over i) with no loop-carried dependency, so LLVM
-# can vectorize it even without fastmath. ij_ji_ij should be the fastest;
-# ji_ij_ji makes every stage stride-N and should be the slowest.
+
+# testing individual building blocks of GEMVER with different loop orders for stages 1, 2, and 4
+# Stage 2 needs the updated A, and Stage 4 needs the completed x.
 @njit
 def _stage1_ij(A, u1, v1, u2, v2):
+    # stage 1, with loop order i then j
     n = A.shape[0]
     for i in range(n):
         for j in range(n):
@@ -262,6 +260,8 @@ def _stage4_ji(alpha, A, w, x):
         for i in range(n):
             w[i] = w[i] + alpha * A[i, j] * x[j]
 
+# put all individual stages together to form the full GEMVER kernel with different loop orders for stages 1, 2, and 4
+# The original PolyBench loop organization:
 @njit
 def gemver_2_ij_ij_ij(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage1_ij(A, u1, v1, u2, v2)
@@ -269,6 +269,7 @@ def gemver_2_ij_ij_ij(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage3(x, z)
     _stage4_ij(alpha, A, w, x)
 
+# The expected best order:
 @njit
 def gemver_2_ij_ji_ij(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage1_ij(A, u1, v1, u2, v2)
@@ -276,6 +277,7 @@ def gemver_2_ij_ji_ij(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage3(x, z)
     _stage4_ij(alpha, A, w, x)
 
+# A mixed case:
 @njit
 def gemver_2_ji_ji_ji(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage1_ji(A, u1, v1, u2, v2)
@@ -283,6 +285,7 @@ def gemver_2_ji_ji_ji(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage3(x, z)
     _stage4_ji(alpha, A, w, x)
 
+# The expected worst order:
 @njit
 def gemver_2_ji_ij_ji(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     _stage1_ji(A, u1, v1, u2, v2)
