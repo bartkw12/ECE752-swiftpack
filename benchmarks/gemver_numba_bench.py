@@ -31,7 +31,7 @@ os.environ["OMP_NUM_THREADS"] = "1"
 import sys
 import time
 import matplotlib.pyplot as plt
-from numba import njit, prange, get_num_threads, threading_layer
+from numba import njit, prange, get_num_threads, set_num_threads, threading_layer
 import numpy as np
 
 # Default benchmark configuration
@@ -1103,6 +1103,204 @@ def run_benchmark(vector_size=DEFAULT_N):
         results.append((name, gflops, elapsed, is_correct))
 
     return results
+
+
+# ---------------------------------------------------------
+# Thread-Count Sweep
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py <N> threads
+#
+# The 5900X has 12 physical cores / 24 logical threads. The sweep runs the
+# parallel baselines at each thread count and compares them with the best
+# serial version (11_fused_fastmath).
+#
+# Expectation / Why: GEMVER is memory-bound, so extra threads only help until
+# the memory system is saturated. Expect the curves to flatten after a few
+# threads at large N (A in DRAM), no gain from 24 logical threads over 12
+# physical cores, and better scaling when A fits in L3.
+THREAD_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24]
+
+def run_thread_sweep(vector_size=DEFAULT_N):
+    (
+        A_initial,
+        u1,
+        v1,
+        u2,
+        v2,
+        w_initial,
+        x_initial,
+        y,
+        z,
+    ) = initialize_gemver(vector_size)
+
+    A_expected, x_expected, w_expected = gemver_numpy_reference(
+        ALPHA,
+        BETA,
+        A_initial,
+        u1,
+        v1,
+        u2,
+        v2,
+        w_initial,
+        x_initial,
+        y,
+        z,
+    )
+
+    total_flops = gemver_flop_count(vector_size)
+    max_threads = get_num_threads()
+    thread_counts = [t for t in THREAD_COUNTS if t <= max_threads]
+
+    def run_once(fn):
+        A = A_initial.copy()
+        x = x_initial.copy()
+        w = w_initial.copy()
+
+        start = time.perf_counter()
+        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z)
+        elapsed = time.perf_counter() - start
+
+        return elapsed, A, x, w
+
+    def measure(fn, min_reps=9, min_time=0.3, max_reps=200):
+        # Warm-up call: compiles on first use and starts the thread pool.
+        run_once(fn)
+
+        # Repeat until enough time has been measured, then take the median,
+        # which is less sensitive to outliers than the mean for short kernels.
+        times = []
+        while len(times) < min_reps or (sum(times) < min_time and len(times) < max_reps):
+            elapsed, A, x, w = run_once(fn)
+            times.append(elapsed)
+
+        is_correct = (
+            np.allclose(A, A_expected, rtol=1e-5, atol=1e-5)
+            and np.allclose(x, x_expected, rtol=1e-5, atol=1e-5)
+            and np.allclose(w, w_expected, rtol=1e-5, atol=1e-5)
+        )
+
+        elapsed = float(np.median(times))
+        gflops = (total_flops / elapsed) / 1e9
+
+        return gflops, elapsed, is_correct
+
+    # Serial reference: the best single-threaded version
+    serial = measure(gemver_fused_11)
+
+    kernels = [
+        ("4_parallel_rows", gemver_parallel_rows_4),
+        ("5_blocked_parallel", gemver_blocked_parallel_5),
+        ("12_fused_parallel", gemver_fused_parallel_12),
+    ]
+
+    results = []
+    for name, fn in kernels:
+        rows = []
+        for t in thread_counts:
+            set_num_threads(t)
+            gflops, elapsed, is_correct = measure(fn)
+            rows.append((t, gflops, elapsed, is_correct))
+        results.append((name, rows))
+
+    set_num_threads(max_threads)
+
+    return thread_counts, serial, results
+
+
+def report_thread_sweep(vector_size):
+    print(f"\nRunning GEMVER Thread-Count Sweep for N={vector_size}...")
+    print(f"CPU: {CPU_NAME}\n")
+
+    thread_counts, serial, results = run_thread_sweep(vector_size)
+    serial_gflops, serial_elapsed, serial_correct = serial
+
+    print(f"Numba threading layer: {threading_layer()}\n")
+
+    header = (
+        f"| {'Baseline Implementation':<28} "
+        f"| {'Threads':>7} "
+        f"| {'GFLOP/s':>10} "
+        f"| {'Time (s)':>12} "
+        f"| {'vs 1 Thread':>12} "
+        f"| {'vs Serial 11':>12} "
+        f"| {'Correct':<8} |"
+    )
+    divider = "-" * len(header)
+
+    print(divider)
+    print(header)
+    print(divider)
+
+    status = "PASS" if serial_correct else "FAIL"
+    print(
+        f"| {'11_fused_fastmath (serial)':<28} "
+        f"| {'-':>7} "
+        f"| {serial_gflops:10.4f} "
+        f"| {serial_elapsed:12.6f} "
+        f"| {'-':>12} "
+        f"| {1.0:11.2f}x "
+        f"| {status:<8} |"
+    )
+    print(divider)
+
+    for name, rows in results:
+        one_thread_elapsed = rows[0][2]
+        for t, gflops, elapsed, is_correct in rows:
+            status = "PASS" if is_correct else "FAIL"
+            print(
+                f"| {name:<28} "
+                f"| {t:>7} "
+                f"| {gflops:10.4f} "
+                f"| {elapsed:12.6f} "
+                f"| {one_thread_elapsed / elapsed:11.2f}x "
+                f"| {serial_elapsed / elapsed:11.2f}x "
+                f"| {status:<8} |"
+            )
+        print(divider)
+
+    # Plotting Output: throughput (left) and self-relative speedup (right)
+    colors = ["#2a78d6", "#eb6834", "#1baf7a"]
+    markers = ["o", "s", "^"]
+    muted = "#898781"
+
+    fig, (ax_gflops, ax_speedup) = plt.subplots(1, 2, figsize=(16, 6))
+
+    max_speedup = 1.0
+    for (name, rows), color, marker in zip(results, colors, markers):
+        gflops_vals = [row[1] for row in rows]
+        speedups = [rows[0][2] / row[2] for row in rows]
+        max_speedup = max(max_speedup, max(speedups))
+
+        ax_gflops.plot(thread_counts, gflops_vals, color=color, marker=marker,
+                       linewidth=2, markersize=8, label=name)
+        ax_speedup.plot(thread_counts, speedups, color=color, marker=marker,
+                        linewidth=2, markersize=8, label=name)
+
+    ax_gflops.axhline(serial_gflops, color=muted, linestyle="--", linewidth=1.5,
+                      label="11_fused_fastmath (serial)")
+    ax_gflops.set_ylim(bottom=0)
+    ax_gflops.set_ylabel("GFLOP/s (Higher is better)")
+    ax_gflops.set_title("Throughput")
+
+    ax_speedup.plot(thread_counts, thread_counts, color=muted, linestyle="--",
+                    linewidth=1.5, label="ideal (linear)")
+    ax_speedup.set_ylim(0, max_speedup * 1.5)
+    ax_speedup.set_ylabel("Speedup over the same kernel on 1 thread")
+    ax_speedup.set_title("Scaling")
+
+    for ax in (ax_gflops, ax_speedup):
+        if 12 in thread_counts:
+            ax.axvline(12, color=muted, linestyle=":", linewidth=1)
+            ax.text(12, ax.get_ylim()[1], " 12 physical cores", color=muted,
+                    ha="left", va="top", fontsize=8)
+        ax.set_xticks(thread_counts)
+        ax.set_xlabel("Numba threads")
+        ax.grid(True, ls="--", alpha=0.3)
+        ax.legend(loc="lower right")
+
+    fig.suptitle(f"Numba GEMVER Thread-Count Sweep (N={vector_size})\nCPU: {CPU_NAME}")
+    plt.tight_layout()
+    plt.show()
 
 
 # ---------------------------------------------------------
