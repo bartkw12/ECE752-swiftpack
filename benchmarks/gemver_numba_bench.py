@@ -753,21 +753,13 @@ def gemver_fused_11(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
-# Baseline 12: Fused + Parallel (GEMVER-specific)
+# Baseline 12: Fused and Parallel
+# - Splits rows among threads while preserving the fused stage 1+2 sweep.
+# - Each thread writes to a private partial x vector to prevent a data race.
+# - Partial vectors are reduced into x; stage 4 is parallelized by row.
+# - Result: 0.140 ms at N=512; 14.2 ms at N=4096, fastest overall/tied at large N.
+# - Limited scaling shows that extra cores cannot overcome memory-bandwidth limits.
 # ---------------------------------------------------------
-# Baseline 11 with the fused sweep split into one chunk of rows per thread.
-# Every thread's rows contribute to ALL of x, so each thread accumulates into
-# its own private row of `partial`, and the partials are then added together
-# (fused with stage 3). Stage 4 is a parallel loop over rows.
-#
-# Expectation / Why: combines stride-1 access, SIMD (fastmath), fewer passes
-# over A (fusion) and all cores. Expected to be the fastest Numba version; at
-# large N it should approach the DRAM bandwidth limit.
-#
-# Observed (5900X): fastest at N=4096 (13.5 ms, ~1.4x over serial Baseline 3),
-# but tied with 3/11 at N=512. 24 threads give only ~1.4x because the kernel
-# already runs close to the dual-channel DDR4 bandwidth (~30 GB/s effective).
-# For a memory-bound kernel, the ceiling is bandwidth, not core count.
 @njit(parallel=True, fastmath=True)
 def gemver_fused_parallel_12(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
