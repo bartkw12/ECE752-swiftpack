@@ -796,6 +796,63 @@ def gemver_fused_parallel_12(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
+# Baseline 13: Pre-Transposed A (GEMVER-specific)
+# ---------------------------------------------------------
+# Stage 2 reads A^T, i.e. columns of row-major A. Instead of interchanging the
+# loops, build a contiguous transpose AT after stage 1 (A changes there) and
+# run stage 2 in its ORIGINAL loop order on AT, which is now stride-1. The
+# copy is inside the timed kernel, because it is part of the cost.
+#
+# Expectation / Why: building AT is itself one strided pass over A (the same
+# access pattern it is trying to avoid) plus N^2 extra bytes written, and the
+# kernel then still reads AT once. Loop interchange (2_order_ij_ji_ij) gets
+# the same stride-1 access with no copy. Expect faster than naive (the strided
+# pass is now a simple copy, not a dependent reduction) but slower than
+# 2_order_ij_ji_ij / Baseline 3.
+@njit
+def gemver_pretranspose_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    AT = np.ascontiguousarray(A.T)
+
+    for i in range(n):
+        for j in range(n):
+            x[i] = x[i] + beta * AT[i, j] * y[j]
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+@njit(fastmath=True)
+def gemver_pretranspose_fastmath_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+
+    for i in range(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+    AT = np.ascontiguousarray(A.T)
+
+    for i in range(n):
+        for j in range(n):
+            x[i] = x[i] + beta * AT[i, j] * y[j]
+
+    for i in range(n):
+        x[i] = x[i] + z[i]
+
+    for i in range(n):
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+
+# ---------------------------------------------------------
 # NumPy Reference Implementation
 # ---------------------------------------------------------
 def gemver_numpy_reference(
