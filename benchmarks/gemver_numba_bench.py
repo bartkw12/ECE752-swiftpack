@@ -52,6 +52,10 @@ L3_cache = "64.0 MB"
 
 # ---------------------------------------------------------
 # Input Initialization
+# - Allocates A and all vectors as contiguous float64 NumPy arrays.
+# - Uses deterministic PolyBench formulas, so every implementation gets identical data.
+# - x and w start at zero because GEMVER accumulates into them.
+# - Fresh copies are required for every run because A, x, and w are modified in place.
 # ---------------------------------------------------------
 def initialize_gemver(n):
     """
