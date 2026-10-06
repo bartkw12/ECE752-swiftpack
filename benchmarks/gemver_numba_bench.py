@@ -4,11 +4,11 @@
 # GEMVER overview
 # - Performs two rank-1 updates, A^T*y, vector addition, and A*x.
 # - Used as a compact benchmark for matrix/vector workloads in numerical computing.
-# - Useful for studying compilers, loop transformations, SIMD, parallelism, and memory access.
 # - Advantage: simple O(N^2) loops with several legal optimization choices.
 # - Limitation: low data reuse, so performance is often limited by memory movement.
 # - Main challenge: stage 2 uses A^T and can read a row-major matrix inefficiently.
 # - Main opportunities: stride-1 access, fastmath/SIMD, loop fusion, and safe parallelism.
+#                   - stride-1 means walking through contiguous memory one element at a time.
 #
 # GEMVER equations
 # - A = A + u1*v1^T + u2*v2^T
@@ -879,6 +879,13 @@ def gemver_pretranspose_fastmath_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # scalar stays in a register. Expect a gain over Baseline 1 and over
 # 2_order_ij_ji_ij (no fastmath), and little or none over Baseline 3, where
 # the loop is already vectorized.
+#
+# Observed (5900X): no measurable change in any of the three variants (all
+# within ~5% of Baseline 1, 2_order_ij_ji_ij and Baseline 3 respectively, at
+# both N=512 and N=4096). The expected store/reload penalty is not there, so
+# the compiler evidently already keeps the running sum in a register. The
+# limits remain the ones found earlier: the add dependency chain without
+# fastmath, and memory traffic with it.
 @njit
 def gemver_scalar_acc_naive_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
