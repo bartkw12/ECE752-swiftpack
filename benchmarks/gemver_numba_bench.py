@@ -323,45 +323,42 @@ def gemver_opt_flags_3(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 # ---------------------------------------------------------
 # Baseline 4: Parallel Loop Versions
+# - parallel_rows uses prange where each iteration owns a distinct output row/element.
+# - Stage 2 stays in the strided order to avoid multiple threads writing the same x values.
+# - parallel_inner starts a parallel region inside every outer j iteration.
+# - legal parallelism can still lose when fork/join overhead or memory traffic dominates.
 # ---------------------------------------------------------
-# parallel_rows: prange over the outer i loop of every stage. Stage 2 is kept
-# in the original (column-reading) order because then each thread owns its
-# own x[i]. The tempting alternative (prange over j in the stride-1 ji order)
-# is a DATA RACE: every thread would update all of x at the same time.
-#
-# parallel_inner: stage 2 in the stride-1 ji order with prange over the INNER
-# i loop, inside a serial j loop (the same as matmul's parallel_k).
-#
-# Expectation / Why: parallel_rows should beat the serial versions (12 cores),
-# but its stage 2 is still strided. parallel_inner starts a new parallel region
-# for every row j (N of them), each doing only N multiply-adds, so thread
-# synchronization overhead dominates and it is likely slower than serial.
-#
-# Observed (5900X): parallel_inner is ~10x slower than serial at N=512, as
-# expected. parallel_rows beats the naive serial code but NOT the serial
-# fastmath version (Baseline 3). At N=512 the whole kernel takes ~0.1 ms, so
-# the four parallel regions' fork/join cost is significant. At N=4096, A (128 MB)
-# lives in DRAM, and one core with stride-1 access already uses most of the
-# memory bandwidth. More threads cannot fetch A faster, and the strided stage 2
-# wastes the bandwidth that is available.
 @njit(parallel=True, fastmath=True)
 def gemver_parallel_rows_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
 
+    # Each thread owns different rows of A.
+    # thread 0 updates row 0, thread 1 updates row 1 -> good stride 1 access
     for i in prange(n):
+        # prange tells Numba that different i iterations may run on different threads.
         for j in range(n):
             A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
 
+    # Each thread owns a different element of x:
+    # give up the best serial order to make straightforward row parallelism safe.
+        # every thread would update the entire x vector (data race)
     for i in prange(n):
         for j in range(n):
             x[i] = x[i] + beta * A[j, i] * y[j]
 
+    # Each thread updates a distinct x[i]
     for i in prange(n):
         x[i] = x[i] + z[i]
 
+    # Each thread owns one output element w[i] and reads one row of A.
     for i in prange(n):
         for j in range(n):
             w[i] = w[i] + alpha * A[i, j] * x[j]
+
+    # this provides:
+        # no data race
+        # stide 1 access
+
 
 @njit(parallel=True, fastmath=True)
 def gemver_parallel_inner_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
@@ -371,8 +368,10 @@ def gemver_parallel_inner_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
         for j in range(n):
             A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
 
+    # try to preserve stride 1 stage 2 order
     for j in range(n):
         for i in prange(n):
+            # race-free because each i iteration owns a distinct element of x.
             x[i] = x[i] + beta * A[j, i] * y[j]
 
     for i in prange(n):
@@ -381,6 +380,9 @@ def gemver_parallel_inner_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     for i in prange(n):
         for j in range(n):
             w[i] = w[i] + alpha * A[i, j] * x[j]
+
+# cost of scheduling threads and synchronizing after every row becomes larger than the useful computation.
+# little work -> introduces far too much parallel overhead.
 
 
 # ---------------------------------------------------------
