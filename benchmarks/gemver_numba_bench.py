@@ -1,20 +1,24 @@
-# gemver kernel in Polybench benchmarking
-# Bart Kowal
-# 400089782
+# GEMVER kernel benchmark
+# Bart Kowal - 400089782
 #
-# GEMVER: A = A + u1*v1^T + u2*v2^T,  x = x + beta*A^T*y + z,  w = w + alpha*A*x
+# GEMVER overview
+# - Performs two rank-1 updates, A^T*y, vector addition, and A*x.
+# - Used as a compact benchmark for matrix/vector workloads in numerical computing.
+# - Useful for studying compilers, loop transformations, SIMD, parallelism, and memory access.
+# - Advantage: simple O(N^2) loops with several legal optimization choices.
+# - Limitation: low data reuse, so performance is often limited by memory movement.
+# - Main challenge: stage 2 uses A^T and can read a row-major matrix inefficiently.
+# - Main opportunities: stride-1 access, fastmath/SIMD, loop fusion, and safe parallelism.
 #
-# Unlike matmul (2N^3 FLOPs on 3N^2 data, so every element of A is reused ~N
-# times), each GEMVER stage touches every element of A exactly once. The whole
-# kernel does ~10 FLOPs per element of A while moving it ~4 times (~32 bytes),
-# i.e. ~0.3 FLOP/byte, so GEMVER is memory-bound. Optimizations that create
-# cache reuse (tiling, BLAS sub-blocks) have little to exploit here; what helps
-# is stride-1 access, SIMD on the reductions, fewer passes over A (fusion), and
-# parallelism until memory bandwidth saturates.
+# GEMVER equations
+# - A = A + u1*v1^T + u2*v2^T
+# - x = x + beta*A^T*y
+# - x = x + z
+# - w = w + alpha*A*x
 #
-# Correctness uses rtol=atol=1e-5: loop interchange, fastmath and parallel
-# reductions change the floating-point summation order, so results differ from
-# the NumPy reference in the last few bits.
+# Correctness
+# - A, x, and w are modified in place and checked against a NumPy reference.
+# - allclose uses rtol=atol=1e-5 because optimized reductions may change rounding order.
 
 import os
 
@@ -1082,6 +1086,9 @@ def run_benchmark(vector_size=DEFAULT_N):
         ("12_fused_parallel", gemver_fused_parallel_12),
         ("13_pretranspose", gemver_pretranspose_13),
         ("13_pretranspose_fastmath", gemver_pretranspose_fastmath_13),
+        ("14_scalar_acc_naive", gemver_scalar_acc_naive_14),
+        ("14_scalar_acc_ij_ji_ij", gemver_scalar_acc_ij_ji_ij_14),
+        ("14_scalar_acc_fastmath", gemver_scalar_acc_fastmath_14),
     ]
 
     for name, fn in functions:
