@@ -387,16 +387,15 @@ def gemver_parallel_inner_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 # ---------------------------------------------------------
 # Baseline 5: Blocked (Tiled) Parallel Code
+# - Divides the matrix into 32x32 tiles and parallelizes independent blocks.
+# - Stage 2 assigns each thread a separate x column block, avoiding a data race.
+
+# - loop tiling changes iteration order to improve locality.
+# - GEMVER has little reuse inside a tile, so blocking gives no major gain.
 # ---------------------------------------------------------
-# Stages 1 and 4: prange over row blocks, bs x bs tiles.
-# Stage 2: prange over COLUMN blocks. Each thread walks every row j but only
-# its own strip of columns, so the reads are stride-1 and each thread owns
-# its own slice of x (no race).
-#
-# Expectation / Why: in matmul, tiling keeps A/B/C tiles in cache and reuses
-# them ~bs times. GEMVER has no reuse within a stage, so the tiles
-# themselves buy nothing. The only gain over Baseline 4 comes from the race-free
-# stride-1 parallel stage 2. Expect roughly Baseline 4, not a matmul-sized jump.
+
+# give each thread a block of x
+# Thread 0 owns x[0:32], Thread 1 owns x[32:64]...
 @njit(parallel=True, fastmath=True)
 def gemver_blocked_parallel_5(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
@@ -432,6 +431,10 @@ def gemver_blocked_parallel_5(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
             for i in range(i_block, i_end):
                 for j in range(j_block, j_end):
                     w[i] = w[i] + alpha * A[i, j] * x[j]
+
+# Blocking is most useful when data loaded into the cache is reused several times.
+# A tile does not remain in the cache for significant repeated computation. 
+# The extra block loops therefore add complexity without creating much additional reuse.
 
 
 # ---------------------------------------------------------
