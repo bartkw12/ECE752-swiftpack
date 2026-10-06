@@ -549,20 +549,12 @@ def gemver_blocked_temp_copy_7(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
-# Baseline 8: Two-Level Blocked Parallel with Temp Copy & np.dot
+# Baseline 8: Two-Level Blocking
+# - Uses 128-wide outer blocks and 32-wide inner blocks for L2/L1 locality. Direct port from matmul.
+# - Result: 0.515 ms at N=512, the slowest blocked version.
+# - Only four outer blocks exist at N=512, so most of the 24 threads receive no work.
+# - Multi-level cache blocking helps only when data is reused; GEMVER mostly streams A.
 # ---------------------------------------------------------
-# Direct port of matmul Baseline 8: L2-sized outer blocks, L1-sized inner
-# blocks, temp copies of the accumulator segment at both levels.
-#
-# Expectation / Why: multi-level blocking keeps a working set resident at each
-# cache level so it can be reused. GEMVER streams each element of A once per
-# stage, so there is nothing to keep resident. This only adds loop and BLAS call
-# overhead: expect equal to or slower than Baseline 7.
-#
-# Observed (5900X): the slowest blocked version at N=512, and roughly equal to
-# the others at N=4096. At N=512 the reason is parallelism, not caching: prange
-# runs over L2 blocks, and n / 128 = 4 blocks means only 4 of the 24 threads
-# get any work. Large blocks reduce the available parallelism.
 @njit(parallel=True, fastmath=True)
 def gemver_two_level_blocked_8(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
