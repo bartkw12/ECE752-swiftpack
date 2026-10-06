@@ -621,20 +621,13 @@ def gemver_two_level_blocked_8(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
-# Baseline 9: Zero Allocation Blocked GEMVER
+# Baseline 9: Zero-Allocation Blocking
+# - Removes np.outer, np.dot, and per-tile temporary arrays from blocked loops.
+        # zero repeated per-tile allocation of large temporary arrays (inside main tile processing loops).
+# - Uses one small accumulator per block/thread and plain compiled loops.
+# - Result: 0.261 ms at N=512; close to the other blocked variants at N=4096.
+# - Conclusion: allocation was not the main bottleneck; matrix traffic remained unchanged.
 # ---------------------------------------------------------
-# Same blocking as Baselines 6/7, but with no np.outer, no np.dot and no
-# temporary arrays inside the tile loops. Each prange iteration allocates one
-# bs-length accumulator once and reuses it for every j-block.
-#
-# Expectation / Why: this isolates what Baselines 6-8 were paying for:
-# per-tile allocations and small BLAS calls. It should be much faster than
-# 6-8, but it cannot beat Baseline 5 by much, because the memory traffic
-# over A is unchanged.
-#
-# Observed (5900X): only faster than Baseline 8, and within noise of 5-7.
-# Allocation and BLAS call overhead were not the bottleneck. Every blocked
-# variant moves the same bytes of A, and that is what sets the time.
 @njit(parallel=True, fastmath=True)
 def gemver_blocked_zero_alloc_9(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
