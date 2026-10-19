@@ -216,3 +216,10 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Local notes for Claude Code (not pushed)
+CLAUDE.md
+.claude/
+
+# Assembly dumps from "python benchmarks/gemver_numba_bench.py <N> asm"
+asm/

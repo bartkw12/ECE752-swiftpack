@@ -46,9 +46,11 @@ BLOCK_SIZE_L1 = 32
 
 # Hardware used for the reported benchmark results
 CPU_NAME = "AMD Ryzen 9 5900X 12-Core Processor @ 4.55 GHz"
-L1_cache = "768 KB"
-L2_cache = "6.0 MB"
-L3_cache = "64.0 MB"
+# Per-core view: 32 KB L1d and 512 KB L2 per core; 32 MB L3 per 6-core CCD.
+# (Chip totals are 384 KB L1d, 6 MB L2, 64 MB L3, but one core only sees its CCD's 32 MB L3.)
+L1_cache = "32 KB per core"
+L2_cache = "512 KB per core"
+L3_cache = "32 MB per CCD (64 MB total)"
 
 # ---------------------------------------------------------
 # Input Initialization
@@ -333,7 +335,7 @@ def gemver_parallel_rows_4(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
 
     # Each thread owns different rows of A.
-    # thread 0 updates row 0, thread 1 updates row 1 -> good stride 1 access
+    # prange gives each thread a contiguous chunk of rows -> good stride 1 access
     for i in prange(n):
         # prange tells Numba that different i iterations may run on different threads.
         for j in range(n):
@@ -793,164 +795,335 @@ def gemver_fused_parallel_12(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
-# Baseline 13: Pre-Transposed A (GEMVER-specific)
+# Removed after testing: Baselines 13 and 14
+# - 13 pre-transposed A: building a contiguous copy of A^T costs a full strided
+#   pass over A. Slower than naive Baseline 1 (154 ms vs 116 ms at N=4096).
+#   Loop interchange (Baseline 2) gets stride-1 access for free.
+# - 14 scalar accumulators (x[i]/w[i] kept in a local variable): no measurable
+#   change. LLVM already keeps the running sum in a register.
 # ---------------------------------------------------------
-# Stage 2 reads A^T, i.e. columns of row-major A. Instead of interchanging the
-# loops, build a contiguous transpose AT after stage 1 (A changes there) and
-# run stage 2 in its ORIGINAL loop order on AT, which is now stride-1. The
-# copy is inside the timed kernel, because it is part of the cost.
-#
-# Expectation / Why: building AT is itself one strided pass over A (the same
-# access pattern it is trying to avoid) plus N^2 extra bytes written, and the
-# kernel then still reads AT once. Loop interchange (2_order_ij_ji_ij) gets
-# the same stride-1 access with no copy. Expect faster than naive (the strided
-# pass is now a simple copy, not a dependent reduction) but slower than
-# 2_order_ij_ji_ij / Baseline 3.
-#
-# Observed (5900X): SLOWER than even the naive Baseline 1 (1.3 ms vs 0.9 ms at
-# N=512, 154 ms vs 116 ms at N=4096), and fastmath barely helps. Compared with
-# Baseline 3, the fastmath variant spends ~120 ms extra at N=4096, i.e. the
-# transposed copy alone costs about as much as the whole naive kernel. The
-# improved locality of stage 2 does not come close to paying for building AT.
+
 
 # ---------------------------------------------------------
-# Baseline 13: Pre-Transposed A
-# - Builds a contiguous AT after stage 1 so stage 2 can read rows with stride-1 access.
-# - Tests both normal and fastmath versions.
-# - Compiler/memory trade-off: simpler contiguous reduction, but an extra N x N copy is required.
-# - Expected to beat the naive strided form but lose to loop interchange, which needs no copy.
+# Baseline 15: Tiling + Register Microkernel
+# - Builds on Baseline 9 (same 32x32 tiles, same parallel split, fastmath).
+# - Microkernel = the small innermost piece of a tiled loop that works on a
+#   tiny block (here 4 rows) entirely in CPU registers.
+#     - Tiling (Baseline 9) keeps data in the L1 cache.
+#     - The microkernel adds one more level: reuse inside registers.
+# - Stage 4 (w = A*x): 4 rows at once (unroll i by 4, "jam" into the j loop)
+#     - x[j] is loaded once and used 4 times.
+#     - 4 independent sums (s0..s3) instead of 1 dependency chain.
+# - Stage 2 (x += A^T*y): 4 rows of A per pass over the x tile
+#     - each acc[ii] is loaded/stored once per 4 rows instead of every row.
+# - Stage 1 unchanged: each A element is touched once and v1[j]/v2[j] already
+#   sit in L1, so there is nothing to keep in registers.
+# - Expect: small gain at N=512 (A in L3), ~no gain at N=4096 (DRAM-bound).
+#   It reduces register/L1 traffic, not DRAM traffic.
 # ---------------------------------------------------------
-@njit
-def gemver_pretranspose_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+@njit(parallel=True, fastmath=True)
+def gemver_tiled_microkernel_15(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    bs = BLOCK_SIZE
+    num_blocks = (n + bs - 1) // bs
+
+    # Stage 1: same as Baseline 9
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            for i in range(i_block, i_end):
+                a1 = u1[i]
+                a2 = u2[i]
+                for j in range(j_block, j_end):
+                    A[i, j] = A[i, j] + a1 * v1[j] + a2 * v2[j]
+
+    # Stage 2: each thread owns a 32-wide block of x (no data race)
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        h = i_end - i_block
+
+        acc_tile = np.empty(bs, dtype=A.dtype)
+        acc = acc_tile[:h]
+        for ii in range(h):
+            acc[ii] = x[i_block + ii]
+
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            j = j_block
+            # microkernel: 4 rows of A update the x tile in one pass
+            while j + 4 <= j_end:
+                c0 = beta * y[j]
+                c1 = beta * y[j + 1]
+                c2 = beta * y[j + 2]
+                c3 = beta * y[j + 3]
+                for ii in range(h):
+                    i = i_block + ii
+                    acc[ii] += (c0 * A[j, i] + c1 * A[j + 1, i]
+                                + c2 * A[j + 2, i] + c3 * A[j + 3, i])
+                j += 4
+            # leftover rows when the tile height is not a multiple of 4
+            while j < j_end:
+                c = beta * y[j]
+                for ii in range(h):
+                    acc[ii] += c * A[j, i_block + ii]
+                j += 1
+
+        for ii in range(h):
+            x[i_block + ii] = acc[ii]
+
+    for i in prange(n):
+        x[i] = x[i] + z[i]
+
+    # Stage 4: each thread owns a 32-row block of w
+    for b in prange(num_blocks):
+        i_block = b * bs
+        i_end = min(i_block + bs, n)
+        h = i_end - i_block
+
+        acc_tile = np.zeros(bs, dtype=A.dtype)
+        acc = acc_tile[:h]
+
+        for j_block in range(0, n, bs):
+            j_end = min(j_block + bs, n)
+            ii = 0
+            # microkernel: 4 rows x one 32-wide tile, 4 sums in registers
+            while ii + 4 <= h:
+                i = i_block + ii
+                s0 = 0.0
+                s1 = 0.0
+                s2 = 0.0
+                s3 = 0.0
+                for j in range(j_block, j_end):
+                    xj = x[j]          # loaded once, used 4 times
+                    s0 += A[i, j] * xj
+                    s1 += A[i + 1, j] * xj
+                    s2 += A[i + 2, j] * xj
+                    s3 += A[i + 3, j] * xj
+                acc[ii] += s0
+                acc[ii + 1] += s1
+                acc[ii + 2] += s2
+                acc[ii + 3] += s3
+                ii += 4
+            # leftover rows
+            while ii < h:
+                i = i_block + ii
+                s = 0.0
+                for j in range(j_block, j_end):
+                    s += A[i, j] * x[j]
+                acc[ii] += s
+                ii += 1
+
+        for ii in range(h):
+            w[i_block + ii] = w[i_block + ii] + alpha * acc[ii]
+
+
+# ---------------------------------------------------------
+# Baseline 16: Hoisting and Common-Subexpression Elimination (CSE) check
+# - Bentley rules from the lecture slides: hoisting (loop-invariant code
+#   motion) and CSE.
+# - Baseline 11 already hoists by hand: a1 = u1[i], a2 = u2[i], c = beta*y[i]
+#   are computed once per row, and the new A value is reused via "a".
+# - Baseline 16 is Baseline 11 with that hand-work UNDONE:
+#     - u1[i], u2[i], beta*y[i] are written inside the inner j loop
+#     - A[i, j] is read back from memory instead of reusing "a"
+# - Question it answers: does the compiler (LLVM) do this for us?
+#     - Same time as 11 -> yes, the compiler hoists it (check with "asm" mode).
+#     - Slower than 11  -> no, the hand hoisting in 11 matters.
+# ---------------------------------------------------------
+@njit(fastmath=True)
+def gemver_no_hoist_16(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
 
     for i in range(n):
         for j in range(n):
+            # loop-invariant values left inside the j loop on purpose
             A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
-
-    AT = np.ascontiguousarray(A.T)
-
-    for i in range(n):
-        for j in range(n):
-            x[i] = x[i] + beta * AT[i, j] * y[j]
+            x[j] += beta * y[i] * A[i, j]
 
     for i in range(n):
         x[i] = x[i] + z[i]
 
+    # stage 4 identical to Baseline 11, so only stage 1+2 differs
     for i in range(n):
+        s = 0.0
         for j in range(n):
-            w[i] = w[i] + alpha * A[i, j] * x[j]
+            s += A[i, j] * x[j]
+        w[i] = w[i] + alpha * s
+
+
+# ---------------------------------------------------------
+# Baseline 17: Fused + Unroll-and-Jam (serial and parallel)
+# - Builds on Baseline 11 (fused stages 1+2), the best serial version.
+# - Unroll the OUTER i loop by 4 and "jam" the 4 copies into one j loop.
+#   (The inner j loop is already unrolled/vectorized by LLVM with fastmath,
+#   so unrolling it by hand would add nothing.)
+# - Stage 1+2: each pass updates 4 rows of A, then x[j] once with all 4.
+#     - x[j] load/store drops from once per row to once per 4 rows.
+#     - v1[j] and v2[j] are loaded once for 4 rows.
+# - Stage 4: same 4-row microkernel idea as Baseline 15 (x[j] loaded once).
+# - A is still read/written the same number of times (3 passes), so DRAM
+#   traffic does not change. Expect a gain at N=512, little at N=4096.
+# - The parallel version gives each thread a chunk of rows and a private
+#   partial x (same race-free scheme as Baseline 12).
+# ---------------------------------------------------------
+@njit(fastmath=True)
+def _fused_rows_4(beta, A, u1, v1, u2, v2, y, xout, row_start, row_end):
+    # Stage 1+2 for rows [row_start, row_end), accumulating A^T*y into xout.
+    n = A.shape[1]
+    i = row_start
+    while i + 4 <= row_end:
+        a10 = u1[i]
+        a11 = u1[i + 1]
+        a12 = u1[i + 2]
+        a13 = u1[i + 3]
+        a20 = u2[i]
+        a21 = u2[i + 1]
+        a22 = u2[i + 2]
+        a23 = u2[i + 3]
+        c0 = beta * y[i]
+        c1 = beta * y[i + 1]
+        c2 = beta * y[i + 2]
+        c3 = beta * y[i + 3]
+        for j in range(n):
+            v1j = v1[j]
+            v2j = v2[j]
+            r0 = A[i, j] + a10 * v1j + a20 * v2j
+            r1 = A[i + 1, j] + a11 * v1j + a21 * v2j
+            r2 = A[i + 2, j] + a12 * v1j + a22 * v2j
+            r3 = A[i + 3, j] + a13 * v1j + a23 * v2j
+            A[i, j] = r0
+            A[i + 1, j] = r1
+            A[i + 2, j] = r2
+            A[i + 3, j] = r3
+            xout[j] += c0 * r0 + c1 * r1 + c2 * r2 + c3 * r3
+        i += 4
+    # leftover rows (n not a multiple of 4)
+    while i < row_end:
+        a1 = u1[i]
+        a2 = u2[i]
+        c = beta * y[i]
+        for j in range(n):
+            a = A[i, j] + a1 * v1[j] + a2 * v2[j]
+            A[i, j] = a
+            xout[j] += c * a
+        i += 1
+
 
 @njit(fastmath=True)
-def gemver_pretranspose_fastmath_13(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
-    n = A.shape[0]
-
-    for i in range(n):
+def _matvec_rows_4(alpha, A, x, w, row_start, row_end):
+    # Stage 4 for rows [row_start, row_end): w += alpha * A * x, 4 rows at once.
+    n = A.shape[1]
+    i = row_start
+    while i + 4 <= row_end:
+        s0 = 0.0
+        s1 = 0.0
+        s2 = 0.0
+        s3 = 0.0
         for j in range(n):
-            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
-
-    AT = np.ascontiguousarray(A.T)
-
-    for i in range(n):
+            xj = x[j]
+            s0 += A[i, j] * xj
+            s1 += A[i + 1, j] * xj
+            s2 += A[i + 2, j] * xj
+            s3 += A[i + 3, j] * xj
+        w[i] += alpha * s0
+        w[i + 1] += alpha * s1
+        w[i + 2] += alpha * s2
+        w[i + 3] += alpha * s3
+        i += 4
+    while i < row_end:
+        s = 0.0
         for j in range(n):
-            x[i] = x[i] + beta * AT[i, j] * y[j]
+            s += A[i, j] * x[j]
+        w[i] += alpha * s
+        i += 1
 
-    for i in range(n):
-        x[i] = x[i] + z[i]
-
-    for i in range(n):
-        for j in range(n):
-            w[i] = w[i] + alpha * A[i, j] * x[j]
-
-
-# ---------------------------------------------------------
-# Baseline 14: Local Scalar Accumulators (GEMVER-specific)
-# ---------------------------------------------------------
-# In the dot-product loops, keep x[i] / w[i] in a local variable and store it
-# once after the inner loop, instead of loading and storing the array element
-# on every iteration. The arithmetic is otherwise unchanged.
-#   scalar_acc_naive:    original order, scalars in stage 2 and stage 4
-#   scalar_acc_ij_ji_ij: best order, scalar in stage 4 only (stage 2 is an
-#                        axpy over x there, so there is nothing to accumulate)
-#   scalar_acc_fastmath: scalar_acc_ij_ji_ij with fastmath
-#
-# Expectation / Why: Numba cannot prove that w (or x) does not overlap A, so
-# "w[i] = w[i] + ..." may store and reload w[i] every iteration, which puts a
-# store-to-load forward on top of the add in the dependency chain. A local
-# scalar stays in a register. Expect a gain over Baseline 1 and over
-# 2_order_ij_ji_ij (no fastmath), and little or none over Baseline 3, where
-# the loop is already vectorized.
-#
-# Observed (5900X): no measurable change in any of the three variants (all
-# within ~5% of Baseline 1, 2_order_ij_ji_ij and Baseline 3 respectively, at
-# both N=512 and N=4096). The expected store/reload penalty is not there, so
-# the compiler evidently already keeps the running sum in a register. The
-# limits remain the ones found earlier: the add dependency chain without
-# fastmath, and memory traffic with it.
-@njit
-def gemver_scalar_acc_naive_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
-    n = A.shape[0]
-
-    for i in range(n):
-        for j in range(n):
-            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
-
-    for i in range(n):
-        s = x[i]
-        for j in range(n):
-            s = s + beta * A[j, i] * y[j]
-        x[i] = s
-
-    for i in range(n):
-        x[i] = x[i] + z[i]
-
-    for i in range(n):
-        s = w[i]
-        for j in range(n):
-            s = s + alpha * A[i, j] * x[j]
-        w[i] = s
-
-@njit
-def gemver_scalar_acc_ij_ji_ij_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
-    n = A.shape[0]
-
-    for i in range(n):
-        for j in range(n):
-            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
-
-    for j in range(n):
-        for i in range(n):
-            x[i] = x[i] + beta * A[j, i] * y[j]
-
-    for i in range(n):
-        x[i] = x[i] + z[i]
-
-    for i in range(n):
-        s = w[i]
-        for j in range(n):
-            s = s + alpha * A[i, j] * x[j]
-        w[i] = s
 
 @njit(fastmath=True)
-def gemver_scalar_acc_fastmath_14(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+def gemver_fused_unroll_jam_17(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
     n = A.shape[0]
-
-    for i in range(n):
-        for j in range(n):
-            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
-
-    for j in range(n):
-        for i in range(n):
-            x[i] = x[i] + beta * A[j, i] * y[j]
-
+    _fused_rows_4(beta, A, u1, v1, u2, v2, y, x, 0, n)
     for i in range(n):
         x[i] = x[i] + z[i]
+    _matvec_rows_4(alpha, A, x, w, 0, n)
 
-    for i in range(n):
-        s = w[i]
-        for j in range(n):
-            s = s + alpha * A[i, j] * x[j]
-        w[i] = s
+
+@njit(parallel=True, fastmath=True)
+def gemver_fused_unroll_jam_parallel_17(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    num_chunks = get_num_threads()
+    # chunk is a multiple of 4 so the unrolled path covers almost every row
+    chunk = ((n + num_chunks - 1) // num_chunks + 3) // 4 * 4
+    partial = np.zeros((num_chunks, n), dtype=A.dtype)
+
+    for t in prange(num_chunks):
+        row_start = min(t * chunk, n)
+        row_end = min(row_start + chunk, n)
+        _fused_rows_4(beta, A, u1, v1, u2, v2, y, partial[t], row_start, row_end)
+
+    for j in prange(n):
+        s = x[j]
+        for t in range(num_chunks):
+            s += partial[t, j]
+        x[j] = s + z[j]
+
+    for t in prange(num_chunks):
+        row_start = min(t * chunk, n)
+        row_end = min(row_start + chunk, n)
+        _matvec_rows_4(alpha, A, x, w, row_start, row_end)
+
+
+# ---------------------------------------------------------
+# Memory Bandwidth Reference (not a GEMVER baseline)
+# - Measures how fast this machine can stream data from DRAM.
+# - Kernel a = a + s*b: reads a, reads b, writes a (3 x 8 bytes per element).
+#     - Same read-modify-write pattern as GEMVER's update of A,
+#       so no hidden write-allocate traffic.
+# - Gives the ceiling used for the "% of peak" column.
+# ---------------------------------------------------------
+STREAM_N = 1 << 24          # 16M doubles = 128 MiB per array, far larger than L3
+
+@njit(fastmath=True)
+def _stream_update_serial(a, b, s):
+    for i in range(a.shape[0]):
+        a[i] = a[i] + s * b[i]
+
+@njit(parallel=True, fastmath=True)
+def _stream_update_parallel(a, b, s):
+    for i in prange(a.shape[0]):
+        a[i] = a[i] + s * b[i]
+
+def measure_bandwidth(reps=10):
+    """Return (serial GB/s, parallel GB/s) for the a = a + s*b kernel."""
+    a = np.ones(STREAM_N)
+    b = np.ones(STREAM_N)
+    nbytes = 3 * 8 * STREAM_N
+    out = []
+    for fn in (_stream_update_serial, _stream_update_parallel):
+        fn(a, b, 1e-9)          # compile + touch pages
+        times = []
+        for _ in range(reps):
+            start = time.perf_counter()
+            fn(a, b, 1e-9)
+            times.append(time.perf_counter() - start)
+        out.append(nbytes / min(times) / 1e9)
+    return out[0], out[1]
+
+
+# Passes over A (each pass = 8*N^2 bytes) used for the effective GB/s column.
+# - Unfused: stage 1 read + stage 1 write + stage 2 read + stage 4 read = 4.
+# - Fused (11, 12, 16, 17): stage 2 reuses A while it is in a register = 3.
+def gemver_passes_over_A(name):
+    fused = ("11_", "12_", "16_", "17_")
+    return 3 if name.startswith(fused) else 4
+
+# Multi-threaded baselines are compared with the parallel bandwidth peak,
+# single-threaded ones with the serial peak (one core cannot use all of DRAM).
+def gemver_is_parallel(name):
+    parallel = ("4_", "5_", "6_", "7_", "8_", "9_", "12_", "15_", "17_fused_unroll_jam_par")
+    return name.startswith(parallel)
 
 
 # ---------------------------------------------------------
@@ -1048,7 +1221,7 @@ def run_benchmark(vector_size=DEFAULT_N):
 
         return elapsed, A, x, w
 
-    def measure(fn, warmup=True, reps=9):
+    def measure(fn, warmup=True, min_reps=9, min_time=0.3, max_reps=200):
         # Warm-up call triggers Numba JIT compilation, so it is not timed.
         if warmup:
             run_once(fn)
@@ -1062,7 +1235,12 @@ def run_benchmark(vector_size=DEFAULT_N):
         )
 
         # Array copies happen outside the timed region of each repetition.
-        elapsed = sum(run_once(fn)[0] for _ in range(reps)) / reps
+        # Repeat until enough time has been measured, then take the median
+        # (short N=512 runs are noisy; the median ignores outliers).
+        times = []
+        while len(times) < min_reps or (sum(times) < min_time and len(times) < max_reps):
+            times.append(run_once(fn)[0])
+        elapsed = float(np.median(times))
         gflops = (total_flops / elapsed) / 1e9
 
         return gflops, elapsed, is_correct
@@ -1071,7 +1249,7 @@ def run_benchmark(vector_size=DEFAULT_N):
 
     # 0. Pure Python (GEMVER is O(N^2), so no size cap is needed for
     # moderate N, but very large N will still take a long time)
-    gflops, elapsed, is_correct = measure(gemver_python_0, warmup=False, reps=1)
+    gflops, elapsed, is_correct = measure(gemver_python_0, warmup=False, min_reps=1, min_time=0.0)
     results.append(("0_python_naive", gflops, elapsed, is_correct))
 
     # Baseline functions list
@@ -1092,11 +1270,10 @@ def run_benchmark(vector_size=DEFAULT_N):
         ("10_numpy", gemver_numpy_10),
         ("11_fused_fastmath", gemver_fused_11),
         ("12_fused_parallel", gemver_fused_parallel_12),
-        ("13_pretranspose", gemver_pretranspose_13),
-        ("13_pretranspose_fastmath", gemver_pretranspose_fastmath_13),
-        ("14_scalar_acc_naive", gemver_scalar_acc_naive_14),
-        ("14_scalar_acc_ij_ji_ij", gemver_scalar_acc_ij_ji_ij_14),
-        ("14_scalar_acc_fastmath", gemver_scalar_acc_fastmath_14),
+        ("15_tiled_microkernel", gemver_tiled_microkernel_15),
+        ("16_no_hoist", gemver_no_hoist_16),
+        ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
+        ("17_fused_unroll_jam_par", gemver_fused_unroll_jam_parallel_17),
     ]
 
     for name, fn in functions:
@@ -1110,28 +1287,20 @@ def run_benchmark(vector_size=DEFAULT_N):
 # Thread-Count Sweep
 # ---------------------------------------------------------
 # Run with:  python gemver_numba_bench.py <N> threads
-#
-# The 5900X has 12 physical cores / 24 logical threads. The sweep runs the
-# parallel baselines at each thread count and compares them with the best
-# serial version (11_fused_fastmath).
-#
-# Expectation / Why: GEMVER is memory-bound, so extra threads only help until
-# the memory system is saturated. Expect the curves to flatten after a few
-# threads at large N (A in DRAM), no gain from 24 logical threads over 12
-# physical cores, and better scaling when A fits in L3.
-#
-# Observed (5900X), N=4096:
-#   12_fused_parallel peaks at 2-4 threads (only ~1.25x over its own 1-thread
-#   run, ~1.4x over serial Baseline 11) and then DROPS back to ~1.0x at 24
-#   threads: once memory is saturated, more threads only add contention.
-#   4_parallel_rows scales best (~4.8x) but only because its 1-thread run is
-#   slow: its strided stage 2 waits on cache misses, and several threads can
-#   wait at once. It flattens at 12 threads (24 adds nothing) and never reaches
-#   serial Baseline 11. Good scaling is not the same as good performance.
-#   5_blocked_parallel flattens at ~2x by 6 threads.
-# Observed (5900X), N=1024 (A = 8 MB, fits in L3): the kernel takes under 1 ms
-#   and the results are not stable between runs (12_fused_parallel at 12 threads
-#   measured both 1.2x and 2.7x), so no scaling conclusion is drawn at this size.
+# - Runs the parallel baselines at 1..24 threads (5900X: 12 cores / 24 threads).
+# - Compares each one with the best serial version (11_fused_fastmath).
+# - Expectation: GEMVER is memory-bound, so threads help only until memory
+#   bandwidth is used up. Curves should flatten after a few threads at N=4096.
+# - Observed (5900X), N=4096:
+#     - 12_fused_parallel peaks at 2-4 threads (~1.25x over its own 1 thread,
+#       ~1.4x over serial 11), then drops back to ~1.0x at 24 threads.
+#       Once memory is saturated, more threads only add contention.
+#     - 4_parallel_rows scales best (~4.8x) only because its 1-thread run is
+#       slow (strided stage 2 waits on cache misses). It never reaches serial 11.
+#       Good scaling is not the same as good performance.
+#     - 5_blocked_parallel flattens at ~2x by 6 threads.
+# - Observed (5900X), N=1024 (A = 8 MB, fits in L3): under 1 ms per run and
+#   too noisy (1.2x and 2.7x for the same setting), so no conclusion drawn.
 THREAD_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24]
 
 def run_thread_sweep(vector_size=DEFAULT_N):
@@ -1205,6 +1374,7 @@ def run_thread_sweep(vector_size=DEFAULT_N):
         ("4_parallel_rows", gemver_parallel_rows_4),
         ("5_blocked_parallel", gemver_blocked_parallel_5),
         ("12_fused_parallel", gemver_fused_parallel_12),
+        ("17_fused_unroll_jam_par", gemver_fused_unroll_jam_parallel_17),
     ]
 
     results = []
@@ -1273,8 +1443,8 @@ def report_thread_sweep(vector_size):
         print(divider)
 
     # Plotting Output: throughput (left) and self-relative speedup (right)
-    colors = ["#2a78d6", "#eb6834", "#1baf7a"]
-    markers = ["o", "s", "^"]
+    colors = ["#2a78d6", "#eb6834", "#1baf7a", "#8e5cd9"]
+    markers = ["o", "s", "^", "D"]
     muted = "#898781"
 
     fig, (ax_gflops, ax_speedup) = plt.subplots(1, 2, figsize=(16, 6))
@@ -1318,6 +1488,46 @@ def report_thread_sweep(vector_size):
 
 
 # ---------------------------------------------------------
+# Assembly Check
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py <N> asm
+# - Prints instruction counts from the machine code Numba generated.
+#     - "vector FMA (ymm)": packed fused multiply-adds on 4 doubles -> SIMD is used.
+#     - "scalar add/FMA": one double at a time -> no SIMD.
+#     - "loads of u1/u2/y in hot loop" is not counted directly; compare the
+#       total size of 11 vs 16 instead (same size -> the compiler hoisted).
+# - Full assembly is written to asm/<name>.s so it can be opened and shown.
+ASM_KERNELS = [
+    ("1_numba_naive", gemver_numba_1),
+    ("3_fastmath_ij_ji_ij", gemver_opt_flags_3),
+    ("11_fused_fastmath", gemver_fused_11),
+    ("16_no_hoist", gemver_no_hoist_16),
+    ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
+]
+
+def report_asm(vector_size):
+    import re
+    A, u1, v1, u2, v2, w, x, y, z = initialize_gemver(vector_size)
+    os.makedirs("asm", exist_ok=True)
+    print(f"\n{'Kernel':<24} | {'vector FMA (ymm)':>16} | {'scalar add/FMA':>14} | {'instructions':>12}")
+    print("-" * 76)
+    for name, fn in ASM_KERNELS:
+        fn(ALPHA, BETA, A.copy(), u1, v1, u2, v2, w.copy(), x.copy(), y, z)  # compile
+        asm = "\n".join(fn.inspect_asm().values())
+        if name.startswith("17_"):
+            # the work happens in the two helpers, so include them
+            for helper in (_fused_rows_4, _matvec_rows_4):
+                asm += "\n".join(helper.inspect_asm().values())
+        with open(os.path.join("asm", name + ".s"), "w") as fh:
+            fh.write(asm)
+        code = [l for l in asm.splitlines() if l.startswith("\t") and not l.startswith("\t.")]
+        vec_fma = sum(1 for l in code if re.search(r"vfn?madd\w*pd\s.*ymm", l))
+        scalar = sum(1 for l in code if re.search(r"\b(vaddsd|vfn?madd\w*sd)\b", l))
+        print(f"{name:<24} | {vec_fma:>16} | {scalar:>14} | {len(code):>12}")
+    print("\nFull assembly written to ./asm/")
+
+
+# ---------------------------------------------------------
 # Formatting and Output Execution
 # ---------------------------------------------------------
 if __name__ == "__main__":
@@ -1341,6 +1551,9 @@ if __name__ == "__main__":
     if len(sys.argv) > 2 and sys.argv[2] == "threads":
         report_thread_sweep(N_input)
         sys.exit(0)
+    if len(sys.argv) > 2 and sys.argv[2] == "asm":
+        report_asm(N_input)
+        sys.exit(0)
 
     print(f"\nRunning GEMVER Benchmarks for N={N_input}...")
     print(f"CPU: {CPU_NAME}")
@@ -1351,6 +1564,18 @@ if __name__ == "__main__":
     # The threading layer is only chosen once a parallel function has run.
     print(f"Numba threading layer: {threading_layer()}\n")
 
+    bw_serial, bw_parallel = measure_bandwidth()
+    a_bytes = 8.0 * N_input * N_input
+    print(f"Measured memory bandwidth (a = a + s*b, 128 MiB arrays): "
+          f"{bw_serial:.1f} GB/s serial (1 thread), {bw_parallel:.1f} GB/s parallel")
+    print(f"A = {a_bytes / 1e6:.1f} MB "
+          f"({'fits in' if a_bytes <= 32e6 else 'larger than'} the 32 MB L3)."
+          f" GB/s = passes over A x size of A / time.")
+    print("% of peak: serial baselines vs the serial number, parallel ones vs the parallel number.")
+    if a_bytes <= 32e6:
+        print("A is served from cache at this size, so '% of peak' can exceed 100%.")
+    print()
+
     py_elapsed = benchmark_data[0][2]  # Reference execution time for pure Python naive
 
     # Table Header Formatting
@@ -1360,6 +1585,8 @@ if __name__ == "__main__":
         f"| {'Time (s)':>12} "
         f"| {'Abs Speedup':>12} "
         f"| {'Rel Speedup':>12} "
+        f"| {'GB/s':>7} "
+        f"| {'% of peak':>11} "
         f"| {'Correct':<8} |"
     )
 
@@ -1375,6 +1602,8 @@ if __name__ == "__main__":
         abs_speedup = py_elapsed / elapsed
         rel_speedup = (prev_elapsed / elapsed) if prev_elapsed is not None else 1.0
         status = "PASS" if is_correct else "FAIL"
+        gbps = gemver_passes_over_A(name) * a_bytes / elapsed / 1e9
+        bw_peak = bw_parallel if gemver_is_parallel(name) else bw_serial
 
         print(
             f"| {name:<28} "
@@ -1382,6 +1611,8 @@ if __name__ == "__main__":
             f"| {elapsed:12.6f} "
             f"| {abs_speedup:11.2f}x "
             f"| {rel_speedup:11.2f}x "
+            f"| {gbps:7.1f} "
+            f"| {100 * gbps / bw_peak:10.0f}% "
             f"| {status:<8} |"
         )
         prev_elapsed = elapsed
