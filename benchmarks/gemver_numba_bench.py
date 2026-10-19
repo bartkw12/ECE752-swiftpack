@@ -1082,6 +1082,10 @@ def gemver_fused_unroll_jam_parallel_17(alpha, beta, A, u1, v1, u2, v2, w, x, y,
 #     - Same read-modify-write pattern as GEMVER's update of A,
 #       so no hidden write-allocate traffic.
 # - Gives the ceiling used for the "% of peak" column.
+# - The parallel kernel is run at several thread counts and the best is kept.
+#     - On the 5900X, 24 threads got LESS bandwidth than 1 thread (27.6 vs 37.2 GB/s).
+#     - Too many memory streams at once can make DRAM slower, so the peak is
+#       usually reached with a few threads, not all 24.
 # ---------------------------------------------------------
 STREAM_N = 1 << 24          # 16M doubles = 128 MiB per array, far larger than L3
 
@@ -1096,20 +1100,33 @@ def _stream_update_parallel(a, b, s):
         a[i] = a[i] + s * b[i]
 
 def measure_bandwidth(reps=10):
-    """Return (serial GB/s, parallel GB/s) for the a = a + s*b kernel."""
+    """
+    Return (serial GB/s, {threads: GB/s}) for the a = a + s*b kernel.
+    The parallel kernel is measured at each thread count up to the maximum.
+    """
     a = np.ones(STREAM_N)
     b = np.ones(STREAM_N)
     nbytes = 3 * 8 * STREAM_N
-    out = []
-    for fn in (_stream_update_serial, _stream_update_parallel):
+
+    def best_gbps(fn):
         fn(a, b, 1e-9)          # compile + touch pages
         times = []
         for _ in range(reps):
             start = time.perf_counter()
             fn(a, b, 1e-9)
             times.append(time.perf_counter() - start)
-        out.append(nbytes / min(times) / 1e9)
-    return out[0], out[1]
+        return nbytes / min(times) / 1e9
+
+    serial = best_gbps(_stream_update_serial)
+
+    max_threads = get_num_threads()
+    by_threads = {}
+    for t in [t for t in [1, 2, 4, 6, 8, 12, 16, 24] if t < max_threads] + [max_threads]:
+        set_num_threads(t)
+        by_threads[t] = best_gbps(_stream_update_parallel)
+    set_num_threads(max_threads)
+
+    return serial, by_threads
 
 
 # Passes over A (each pass = 8*N^2 bytes) used for the effective GB/s column.
@@ -1118,12 +1135,6 @@ def measure_bandwidth(reps=10):
 def gemver_passes_over_A(name):
     fused = ("11_", "12_", "16_", "17_")
     return 3 if name.startswith(fused) else 4
-
-# Multi-threaded baselines are compared with the parallel bandwidth peak,
-# single-threaded ones with the serial peak (one core cannot use all of DRAM).
-def gemver_is_parallel(name):
-    parallel = ("4_", "5_", "6_", "7_", "8_", "9_", "12_", "15_", "17_fused_unroll_jam_par")
-    return name.startswith(parallel)
 
 
 # ---------------------------------------------------------
@@ -1564,14 +1575,18 @@ if __name__ == "__main__":
     # The threading layer is only chosen once a parallel function has run.
     print(f"Numba threading layer: {threading_layer()}\n")
 
-    bw_serial, bw_parallel = measure_bandwidth()
+    bw_serial, bw_by_threads = measure_bandwidth()
+    best_t = max(bw_by_threads, key=bw_by_threads.get)
+    bw_peak = max(bw_serial, bw_by_threads[best_t])
     a_bytes = 8.0 * N_input * N_input
-    print(f"Measured memory bandwidth (a = a + s*b, 128 MiB arrays): "
-          f"{bw_serial:.1f} GB/s serial (1 thread), {bw_parallel:.1f} GB/s parallel")
+    print("Measured memory bandwidth (a = a + s*b, 128 MiB arrays):")
+    print(f"  serial kernel: {bw_serial:.1f} GB/s")
+    print("  parallel kernel: " + ", ".join(
+        f"{t} thr {g:.1f}" for t, g in bw_by_threads.items()) + " GB/s")
+    print(f"  peak used for '% of peak': {bw_peak:.1f} GB/s")
     print(f"A = {a_bytes / 1e6:.1f} MB "
           f"({'fits in' if a_bytes <= 32e6 else 'larger than'} the 32 MB L3)."
           f" GB/s = passes over A x size of A / time.")
-    print("% of peak: serial baselines vs the serial number, parallel ones vs the parallel number.")
     if a_bytes <= 32e6:
         print("A is served from cache at this size, so '% of peak' can exceed 100%.")
     print()
@@ -1603,7 +1618,6 @@ if __name__ == "__main__":
         rel_speedup = (prev_elapsed / elapsed) if prev_elapsed is not None else 1.0
         status = "PASS" if is_correct else "FAIL"
         gbps = gemver_passes_over_A(name) * a_bytes / elapsed / 1e9
-        bw_peak = bw_parallel if gemver_is_parallel(name) else bw_serial
 
         print(
             f"| {name:<28} "
