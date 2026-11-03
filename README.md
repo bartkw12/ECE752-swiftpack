@@ -78,7 +78,7 @@ python demos/roofline.py --plot-only --html                # redraw from saved r
 Charts, `results.json` and a summary table are written to `demos/roofline_output/`. On the cluster it can be added to `run_bench.sh` as:
 
 ```bash
-python3 $(pwd)/demos/roofline.py --out $(pwd)/doc/roofline
+python3 $(pwd)/demos/roofline.py
 ```
 
 A bench file can optionally define `roofline_bytes(name, n)` to return the bytes a baseline moves at size `n` (or `None` for the built-in estimate), as `benchmarks/gemver_numba_bench.py` does.
