@@ -1137,6 +1137,13 @@ def gemver_passes_over_A(name):
     return 3 if name.startswith(fused) else 4
 
 
+# Roofline hook (used by demos/roofline.py)
+# - Bytes moved = passes over A x 8 bytes x N^2 (vectors are O(N), ignored).
+# - Unfused baselines read/write A 4 times, fused ones 3 times.
+def roofline_bytes(name, n):
+    return gemver_passes_over_A(name) * 8.0 * n * n
+
+
 # ---------------------------------------------------------
 # NumPy Reference Implementation
 # ---------------------------------------------------------
@@ -1657,4 +1664,12 @@ if __name__ == "__main__":
     plt.yscale("log")
     plt.grid(True, which="both", ls="--", alpha=0.5)
     plt.tight_layout()
-    plt.show()
+
+    # Optional image path as the second argument (same as upstream matmul / run_bench.sh)
+    # - With a path: save the PNG, no window (works on a server with no display).
+    # - Without: show the window, as in the live walkthrough.
+    if len(sys.argv) > 2:
+        plt.savefig(sys.argv[2], dpi=300)
+        print(f"Plot saved to {sys.argv[2]}")
+    else:
+        plt.show()
