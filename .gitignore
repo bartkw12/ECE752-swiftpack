@@ -220,7 +220,6 @@ __marimo__/
 # Local notes for Claude Code (not pushed)
 CLAUDE.md
 .claude/
-Roofline_script_Claude_Code_hand-off.md
 
 # Assembly dumps from "python benchmarks/gemver_numba_bench.py <N> asm"
 asm/
