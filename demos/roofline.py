@@ -779,6 +779,7 @@ def build_roofs(machine, args):
         if not roofs[c]["dram"]:
             roofs[c]["dram"] = roofs["1" if c == "all" else "all"]["dram"]
     roofs["l3_instance_mb"] = machine.get("l3_instance_mb")
+    roofs["l3_total_mb"] = machine.get("l3_total_mb")
     return roofs
 
 
@@ -818,14 +819,18 @@ def analyze(run, roofs, ai_override=None):
         return dict(kernel=key, n=n, run=run, points=pts, start=None, best=None, warnings=warnings,
                     status="AI unknown, add a table entry or roofline_bytes()" if start else "no compiled baselines")
 
-    l3_mb = roofs.get("l3_instance_mb")
     ws = float(entry["ws"](n, g)) if entry else None
-    # L3 roof only if the working set fits comfortably in one L3 instance
-    level = "l3" if (ws is not None and l3_mb and ws <= 0.8 * l3_mb * 2**20) else "dram"
+    # L3 roof only if the working set fits comfortably in the L3 the baseline can use
+    # - serial: one L3 instance (one CCD on AMD)
+    # - parallel: all instances (threads on both CCDs share the work)
+    l3_one = roofs.get("l3_instance_mb")
+    l3_all = max(roofs.get("l3_total_mb") or 0, l3_one or 0) or None
     for p in pts:
         # Python rows (capped at N=128 in some files) take the start row's AI
         p["AI"] = start["F"] / start["B"] if p["python"] else p["F"] / p["B"]
         cores = "all" if p["parallel"] else "1"
+        cap = l3_all if p["parallel"] else l3_one
+        level = "l3" if (ws is not None and cap and ws <= 0.8 * cap * 2**20) else "dram"
         lvl = level if roofs[cores].get(level) else "dram"
         pi, beta = roofs[cores]["peak"], roofs[cores][lvl]
         p["cores"], p["level"] = cores, lvl
@@ -851,7 +856,7 @@ def analyze(run, roofs, ai_override=None):
         serial = [p for p in near if not p["parallel"]]
         best = max(serial or near, key=lambda p: p["P"])
     return dict(kernel=key, n=n, run=run, points=pts, start=start, best=best, unit=unit,
-                warnings=warnings, level=level, ws=ws, status="ok")
+                warnings=warnings, ws=ws, status="ok")
 
 
 def summary_row(res):
@@ -1812,7 +1817,8 @@ h1 { font-size: 28px; margin: 0 0 4px; }
 #chart { display: grid; }
 #chart .view { grid-area: 1 / 1; }
 #chart:not(.all) .view.a, #chart.all .view.b { visibility: hidden; }
-.hit { fill: transparent; cursor: pointer; outline: none; }
+.hit { fill: transparent; pointer-events: none; outline: none; }
+svg.near { cursor: pointer; }
 .hit:focus { stroke: #2a78d6; stroke-width: 1.5; }
 #tip { position: fixed; pointer-events: none; background: var(--tip); color: var(--tip-ink); border-radius: 8px;
   padding: 9px 12px; font-size: 13px; line-height: 1.5; box-shadow: 0 6px 24px rgba(0,0,0,.25);
@@ -1872,11 +1878,13 @@ function showTip(id, x, y) {
 }
 function hideTip() { tip.style.display = "none"; }
 
-// Hit targets bigger than the dots (about 24 px across), in the SVG's own units
+// Each dot gets a focusable circle (keyboard), and the mouse picks the nearest
+// visible dot within 12 px, so dots stacked on top of each other stay reachable.
 function addHits(svg, prefix) {
   const scale = svg.getScreenCTM().a || 1;
   const r = 12 / scale;
   const toRoot = svg.getCTM().inverse();
+  const dots = [];
   for (const id of Object.keys(DATA.points)) {
     const el = document.getElementById(prefix + "-" + id);
     if (!el) continue;
@@ -1888,12 +1896,24 @@ function addHits(svg, prefix) {
     c.setAttribute("class", "hit " + id.split("-")[0]);
     c.setAttribute("tabindex", "0");
     c.setAttribute("aria-label", DATA.points[id].kernel + " " + DATA.points[id].name);
-    c.addEventListener("mousemove", e => showTip(id, e.clientX, e.clientY));
-    c.addEventListener("mouseleave", hideTip);
     c.addEventListener("focus", () => { const b = c.getBoundingClientRect(); showTip(id, b.right, b.top); });
     c.addEventListener("blur", hideTip);
     svg.appendChild(c);
+    dots.push({ id, x: pt.x, y: pt.y, c });
   }
+  svg.addEventListener("mousemove", e => {
+    const p = new DOMPoint(e.clientX, e.clientY).matrixTransform(svg.getScreenCTM().inverse());
+    const lim = 12 / (svg.getScreenCTM().a || 1);
+    let best = null, bestD = lim * lim;
+    for (const d of dots) {
+      if (d.c.style.display === "none") continue;
+      const dd = (d.x - p.x) ** 2 + (d.y - p.y) ** 2;
+      if (dd <= bestD) { best = d; bestD = dd; }
+    }
+    svg.classList.toggle("near", !!best);
+    if (best) showTip(best.id, e.clientX, e.clientY); else hideTip();
+  });
+  svg.addEventListener("mouseleave", () => { svg.classList.remove("near"); hideTip(); });
 }
 
 function setMode(all) {
