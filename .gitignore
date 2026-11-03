@@ -223,3 +223,6 @@ CLAUDE.md
 
 # Assembly dumps from "python benchmarks/gemver_numba_bench.py <N> asm"
 asm/
+
+# Output of demos/roofline.py
+demos/roofline_output/
