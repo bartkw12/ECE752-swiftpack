@@ -71,8 +71,9 @@ Result verified successfully against NumPy!
 
 ```bash
 python demos/roofline.py                                   # every benchmark
-python demos/roofline.py benchmarks/gemver_numba_bench.py  # one kernel, detailed chart
+python demos/roofline.py benchmarks/matmul_numba_bench.py  # one kernel, detailed chart
 python demos/roofline.py --plot-only --html                # redraw from saved results
+python demos/roofline.py --help                            # all options, with examples
 ```
 
 Charts, `results.json` and a summary table are written to `demos/roofline_output/`. On the cluster it can be added to `run_bench.sh` as:
@@ -81,7 +82,7 @@ Charts, `results.json` and a summary table are written to `demos/roofline_output
 python3 $(pwd)/demos/roofline.py
 ```
 
-A bench file can optionally define `roofline_bytes(name, n)` to return the bytes a baseline moves at size `n` (or `None` for the built-in estimate), as `benchmarks/gemver_numba_bench.py` does.
+A bench file can optionally define `roofline_bytes(name, n)` to return the bytes a baseline moves at size `n` (or `None` for the built-in estimate).
 
 ## Quick usage example
 
