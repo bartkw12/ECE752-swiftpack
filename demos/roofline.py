@@ -2115,33 +2115,64 @@ def write_html(report, rows, out, args):
 # ---------------------------------------------------------
 # Command line
 # ---------------------------------------------------------
+HELP_EXAMPLES = """\
+examples:
+  python demos/roofline.py                                   every benchmarks/*_bench.py
+  python demos/roofline.py benchmarks/matmul_numba_bench.py  one kernel, with its detailed chart
+  python demos/roofline.py --n 256                           same N for every kernel (faster)
+  python demos/roofline.py --n matmul=1024                   N for one kernel only
+  python demos/roofline.py --plot-only --html                redraw saved results, add the web page
+  python demos/roofline.py --plot-only --all                 every baseline on the class chart
+
+Charts, a summary table and results.json are written to demos/roofline_output/.
+A bench file can define roofline_bytes(name, n) for exact bytes (see the top of this file).
+"""
+
+
 def parse_args(argv):
     p = argparse.ArgumentParser(
-        description="Run every benchmarks/*_bench.py and draw the class roofline.",
-        formatter_class=argparse.RawDescriptionHelpFormatter)
-    p.add_argument("paths", nargs="*", help="bench files or folders (default: benchmarks/)")
-    p.add_argument("--n", action="append", help="N for every kernel, or kernel=N (repeatable)")
-    p.add_argument("--out", default=str(DEFAULT_OUT), help="output folder")
-    p.add_argument("--plot-only", action="store_true", help="redraw from saved results.json")
-    p.add_argument("--all", action="store_true", help="class chart shows every baseline")
-    p.add_argument("--per-kernel", action="store_true", default=None,
-                   help="one detailed chart per kernel (default: on for one file)")
-    p.add_argument("--include-python", action="store_true", help="show the pure-Python baselines")
-    p.add_argument("--html", action="store_true", help="also write roofline.html")
-    p.add_argument("--show", action="store_true", help="open the chart window at the end")
-    # - every kernel finishes in under 160 s on the 5900X, so 600 s is ample headroom
+        prog="python demos/roofline.py",
+        description="Run every benchmarks/*_bench.py, measure this machine's roofs, "
+                    "and draw the class roofline.",
+        epilog=HELP_EXAMPLES, formatter_class=argparse.RawDescriptionHelpFormatter)
+
+    run = p.add_argument_group("what to run")
+    run.add_argument("paths", nargs="*", metavar="FILE_OR_FOLDER",
+                     help="bench files or folders (default: benchmarks/)")
+    run.add_argument("--n", action="append", metavar="N | KERNEL=N",
+                     help="problem size for every kernel, or for one kernel (repeatable)")
+    run.add_argument("--plot-only", action="store_true", help="run nothing; redraw from saved results")
+    run.add_argument("--out", default=str(DEFAULT_OUT), metavar="DIR",
+                     help="output folder (default: demos/roofline_output/)")
+    # - every kernel finishes in under 160 s on a 12-core desktop, so 600 s is ample headroom
     # - 2100 s leaves 10 of SLURM's 45 minutes for run_bench.sh's venv setup and matmul run
-    p.add_argument("--timeout", type=float, default=600, help="seconds per bench file")
-    p.add_argument("--budget", type=float, default=2100,
-                   help="seconds for the whole run; no new file starts after this")
-    p.add_argument("--remeasure", action="store_true", help="measure the machine again")
-    p.add_argument("--peak-gflops", help="peak GFLOP/s: 1CORE[,ALL]")
-    p.add_argument("--bandwidth", help="DRAM GB/s, read + write: 1CORE[,ALL]")
-    p.add_argument("--read-bandwidth", help="DRAM GB/s, read only: 1CORE[,ALL]")
-    p.add_argument("--l3-bandwidth", help="L3 GB/s: 1CORE[,ALL]")
-    p.add_argument("--l3-mb", type=float, help="L3 size of ONE instance in MB (e.g. 32 on a 5900X)")
-    p.add_argument("--peak-source", choices=["measured", "theoretical"], default="measured")
-    p.add_argument("--ai", action="append", help="force AI for a kernel: kernel=value")
+    run.add_argument("--timeout", type=float, default=600, metavar="SEC",
+                     help="stop a bench file after this many seconds (default: 600)")
+    run.add_argument("--budget", type=float, default=2100, metavar="SEC",
+                     help="no new bench file starts after this many seconds (default: 2100)")
+
+    chart = p.add_argument_group("chart options")
+    chart.add_argument("--all", action="store_true", help="show every baseline, not just start and best")
+    chart.add_argument("--per-kernel", action="store_true", default=None,
+                       help="one detailed chart per kernel (on by default for a single file)")
+    chart.add_argument("--include-python", action="store_true", help="also show the pure-Python baselines")
+    chart.add_argument("--html", action="store_true", help="also write the interactive roofline.html")
+    chart.add_argument("--show", action="store_true", help="open the class chart in a window at the end")
+
+    machine = p.add_argument_group("machine numbers (measured automatically; override if needed)")
+    machine.add_argument("--remeasure", action="store_true", help="measure the roofs again")
+    machine.add_argument("--peak-gflops", metavar="GFLOPS[,ALL]",
+                         help="peak GFLOP/s: 1 core, or 1 core,all cores")
+    machine.add_argument("--bandwidth", metavar="GBS[,ALL]", help="DRAM GB/s, read + write")
+    machine.add_argument("--read-bandwidth", metavar="GBS[,ALL]", help="DRAM GB/s, read only")
+    machine.add_argument("--l3-bandwidth", metavar="GBS[,ALL]", help="L3 GB/s")
+    machine.add_argument("--l3-mb", type=float, metavar="MB",
+                         help="L3 size of one instance (e.g. 32 per CCD on a Ryzen 5900X)")
+    machine.add_argument("--peak-source", choices=["measured", "theoretical"], default="measured",
+                         help="which peak to use as the roof (default: measured)")
+    machine.add_argument("--ai", action="append", metavar="KERNEL=AI",
+                         help="force the arithmetic intensity of one kernel")
+
     p.add_argument("--_worker", help=argparse.SUPPRESS)
     p.add_argument("--json", help=argparse.SUPPRESS)
     return p.parse_args(argv)
@@ -2158,6 +2189,9 @@ def main(argv=None):
 
     out = Path(args.out).resolve()
     out.mkdir(parents=True, exist_ok=True)
+    # the output folder ignores itself, so the repo's .gitignore needs no change
+    if not (out / ".gitignore").exists():
+        (out / ".gitignore").write_text("# written by demos/roofline.py\n*\n", encoding="utf-8")
     data = load_results(out)
 
     explicit = [Path(p) for p in args.paths]
