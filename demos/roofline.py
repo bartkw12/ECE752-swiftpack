@@ -60,6 +60,10 @@ BLAS_ENV = ("OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS", "OMP_NUM_THREADS",
 # - flops is only for a sanity warning; the plotted FLOPs are the student's own.
 # - bytes assume perfect cache reuse (what a well-blocked version achieves).
 # - ws = working set, used to pick the L3 or DRAM roof.
+# - Default N: measured on a Ryzen 9 5900X (24 threads), whole class in 767 s:
+#   gemver 4096: 117 s, matmul 512: 70 s, 2mm 512: 153 s, heat3d 128: 100 s,
+#   correlation 512: 119 s, atax 4096: 138 s, syrk 512: 47 s, roofs: 11 s.
+#   (atax 8192 removes its cache reuse, 86% of roof instead of 126%, but takes 532 s.)
 # ---------------------------------------------------------
 def _g(g, name, default):
     try:
@@ -98,7 +102,8 @@ KERNELS = {
                    #   ownership (write-allocate): 8 + 8 + 8 = 24 bytes per point
                    bytes=lambda n, g: 24 * _g(g, "steps", 20) * n**3,
                    ws=lambda n, g: 16 * n**3),
-    "atax": dict(label="ATAX", student="Ethan", aliases=[], n=4096,
+    # traffic="read": A is only read, so it is judged against the read-only DRAM roof
+    "atax": dict(label="ATAX", student="Ethan", aliases=[], n=4096, traffic="read",
                  flops=lambda n, g: 4 * n**2,
                  bytes=lambda n, g: 8 * n**2,         # A read once (split versions read it twice)
                  ws=lambda n, g: 8 * n**2),
@@ -120,6 +125,8 @@ KERNELS = {
                            bytes=lambda n, g: 16 * n**3,  # the path matrix streams once per k step
                            ws=lambda n, g: 8 * n**2),
 }
+
+LEVEL_NAMES = {"dram": "DRAM", "dram_read": "DRAM read-only", "l3": "L3"}
 
 PAR_RE = re.compile(r"(^|_)par(allel)?(_|$)", re.IGNORECASE)
 FAMILY_RE = re.compile(r"^v?(\d+)_")
@@ -584,12 +591,28 @@ def _stream_kernels():
         for i in prange(a.shape[0]):
             a[i] = a[i] + s * b[i]
 
-    return triad_serial, triad_parallel
+    # Read-only stream: s += a[i] (8 bytes per element, nothing written)
+    # - Kernels that only read their big array (atax) can beat the read + write roof.
+    @njit(fastmath=True)
+    def read_serial(a, b, s):
+        t = 0.0
+        for i in range(a.shape[0]):
+            t += a[i]
+        return t
+
+    @njit(parallel=True, fastmath=True)
+    def read_parallel(a, b, s):
+        t = 0.0
+        for i in prange(a.shape[0]):
+            t += a[i]
+        return t
+
+    return triad_serial, triad_parallel, read_serial, read_parallel
 
 
-def _best_gbps(fn, a, b, min_time=0.0, reps=10):
+def _best_gbps(fn, a, b, min_time=0.0, reps=10, bytes_per_elem=24.0):
     fn(a, b, 1e-9)                      # compile + touch pages
-    nbytes = 24.0 * a.shape[0]
+    nbytes = bytes_per_elem * a.shape[0]
     best, total, count = float("inf"), 0.0, 0
     while count < reps or total < min_time:
         t = time.perf_counter()
@@ -640,7 +663,7 @@ def measure_machine(info, l3_instance_mb, log=print):
     log(f"  peak: {m['peak_1']:.1f} GFLOP/s 1 core, {m['peak_all']:.1f} all cores")
 
     # DRAM bandwidth: arrays far larger than L3
-    triad_serial, triad_parallel = _stream_kernels()
+    triad_serial, triad_parallel, read_serial, read_parallel = _stream_kernels()
     l3_total = (info.get("l3_total_mb") or 32.0) * 2**20
     n = int(max(128 * 2**20, 4 * l3_total) // 8)
     big_a, big_b = np.ones(n), np.ones(n)
@@ -654,9 +677,19 @@ def measure_machine(info, l3_instance_mb, log=print):
     #   on the 5900X 24 threads got LESS than 1 (27.6 vs 37.2 GB/s).
     m["dram_by_threads"] = {str(k): v for k, v in by_threads.items()}
     m["dram_all"] = max(max(by_threads.values()), m["dram_1"])
-    del big_a, big_b
     log(f"  DRAM: {m['dram_1']:.1f} GB/s 1 core, {m['dram_all']:.1f} best of "
-        + ", ".join(f"{k} thr {v:.1f}" for k, v in by_threads.items()))
+        + ", ".join(f"{k} thr {v:.1f}" for k, v in by_threads.items()) + "  (read + write)")
+    m["dram_read_1"] = _best_gbps(read_serial, big_a, big_b, bytes_per_elem=8.0)
+    read_by = {}
+    for t in _thread_counts(max_threads, physical):
+        set_num_threads(t)
+        read_by[t] = _best_gbps(read_parallel, big_a, big_b, bytes_per_elem=8.0)
+    set_num_threads(max_threads)
+    m["dram_read_by_threads"] = {str(k): v for k, v in read_by.items()}
+    m["dram_read_all"] = max(max(read_by.values()), m["dram_read_1"])
+    del big_a, big_b
+    log(f"  DRAM: {m['dram_read_1']:.1f} GB/s 1 core, {m['dram_read_all']:.1f} best of "
+        + ", ".join(f"{k} thr {v:.1f}" for k, v in read_by.items()) + "  (read only)")
 
     # L3 bandwidth: both arrays together fill about half of one L3 instance
     n = int(l3_instance_mb * 2**20 / 4 // 8)
@@ -712,7 +745,9 @@ def load_machine(out, args, need_measure, log=print):
     else:
         profile["l3_instance_mb"] = None
 
-    if saved and saved.get("key") == key and saved.get("measured") and not args.remeasure:
+    # reuse the cached roofs only if they come from this machine and have every field
+    if (saved and saved.get("key") == key and (saved.get("measured") or {}).get("dram_read_all")
+            and not args.remeasure):
         profile["measured"] = saved["measured"]
         profile["measured_at"] = saved.get("measured_at")
         if profile != saved:
@@ -766,8 +801,10 @@ def build_roofs(machine, args):
             peak, src = theo.get(c), "theoretical"
         roofs[c] = dict(peak=peak, peak_src=src, theo=theo.get(c),
                         dram=meas.get(f"dram_{c}"), dram_src="measured",
+                        dram_read=meas.get(f"dram_read_{c}"), dram_read_src="measured",
                         l3=meas.get(f"l3_{c}"), l3_src="measured")
-    for flag, field in (("peak_gflops", "peak"), ("bandwidth", "dram"), ("l3_bandwidth", "l3")):
+    for flag, field in (("peak_gflops", "peak"), ("bandwidth", "dram"), ("read_bandwidth", "dram_read"),
+                        ("l3_bandwidth", "l3")):
         value = getattr(args, flag, None)
         if value:
             one, allc = _parse_pair(value)
@@ -778,6 +815,10 @@ def build_roofs(machine, args):
             roofs[c]["peak"] = roofs["1" if c == "all" else "all"]["peak"]
         if not roofs[c]["dram"]:
             roofs[c]["dram"] = roofs["1" if c == "all" else "all"]["dram"]
+    for c in ("1", "all"):
+        # a read-only kernel can always do at least what the read + write stream does
+        if roofs[c]["dram"] and (roofs[c]["dram_read"] or 0) < roofs[c]["dram"]:
+            roofs[c]["dram_read"], roofs[c]["dram_read_src"] = roofs[c]["dram"], roofs[c]["dram_src"]
     roofs["l3_instance_mb"] = machine.get("l3_instance_mb")
     roofs["l3_total_mb"] = machine.get("l3_total_mb")
     return roofs
@@ -831,6 +872,8 @@ def analyze(run, roofs, ai_override=None):
         cores = "all" if p["parallel"] else "1"
         cap = l3_all if p["parallel"] else l3_one
         level = "l3" if (ws is not None and cap and ws <= 0.8 * cap * 2**20) else "dram"
+        if level == "dram" and (entry or {}).get("traffic") == "read":
+            level = "dram_read"           # mostly-read kernels: read-only DRAM roof
         lvl = level if roofs[cores].get(level) else "dram"
         pi, beta = roofs[cores]["peak"], roofs[cores][lvl]
         p["cores"], p["level"] = cores, lvl
@@ -840,6 +883,9 @@ def analyze(run, roofs, ai_override=None):
         p["bound"] = "Memory-bound" if p["AI"] < p["ridge"] else "Compute-bound"
         p["far"] = p["pct"] < 0.10 or p["python"]
         p["verdict"] = p["bound"] + (", far below the roof (locality or overhead)" if p["far"] else "")
+        if p["pct"] > 1.0:
+            # e.g. atax at N=4096: A (134 MB) is only 2x the L3, so repeated runs reuse part of it
+            p["verdict"] += ", above the roof (some data reused from cache)"
         if entry and not p["python"]:
             ref = float(entry["flops"](n, g))
             ratio = p["F"] / ref if ref else 1.0
@@ -871,7 +917,7 @@ def summary_row(res):
     if best:
         cores = "all cores" if best["cores"] == "all" else "1 core"
         row.update(best=best["name"], best_gflops=best["P"], speedup=best["P"] / start["P"],
-                   ai=best["AI"], roof_used=f"{'L3' if best['level'] == 'l3' else 'DRAM'}, {cores}",
+                   ai=best["AI"], roof_used=f"{LEVEL_NAMES[best['level']]}, {cores}",
                    roof=best["roof"], pct=best["pct"], verdict=best["verdict"],
                    bound=best["bound"], bytes_src=best["bytes_src"])
     else:
@@ -1032,7 +1078,8 @@ def write_summary(report, out, args):
     for c, label in (("1", "1 core"), ("all", "all cores")):
         r = roofs[c]
         lines.append(f"- {label}: peak {_fmt(r['peak'])} GFLOP/s ({r['peak_src']}), "
-                     f"DRAM {_fmt(r['dram'])} GB/s ({r['dram_src']})"
+                     f"DRAM {_fmt(r['dram'])} GB/s read + write ({r['dram_src']}), "
+                     f"{_fmt(r['dram_read'])} GB/s read-only ({r['dram_read_src']})"
                      + (f", L3 {_fmt(r['l3'])} GB/s ({r['l3_src']})" if r.get("l3") else "")
                      + (f", ridge {_fmt(r['peak'] / r['dram'])} FLOP/byte" if r['peak'] and r['dram'] else ""))
     lines += ["", "| Kernel | Student | N | Start | Best baseline | Best | Speedup | AI | Roof used "
@@ -1075,6 +1122,9 @@ def write_summary(report, out, args):
 def footnotes(report, args):
     notes = ["Bytes are an estimate: perfect cache reuse for the N^3 kernels, so naive versions "
              "sit well below the roof (that gap is loop order and blocking)."]
+    if any(p.get("level") == "dram_read" for r in report["results"] for p in r["points"]):
+        notes.append("Kernels that only read their big array (ATAX) use the read-only DRAM roof (dash-dot); "
+                     "the others read and write, like Bart's a = a + s*b stream.")
     if any(KERNELS.get(r["kernel"], {}).get("unit") == "OP" for r in report["results"]):
         notes.append("Floyd-Warshall does integer/compare work; plotted as operations per second.")
     if not args.include_python:
@@ -1276,13 +1326,21 @@ def _slant_label(ax, text, bw, xlim, ylim, ridge, frac, above, color, size=8.5, 
     lo, hi = math.log10(ylim[0]), math.log10(ylim[1])
     y = 10 ** (lo + frac * (hi - lo))
     x = min(max(y / bw, xlim[0] * 1.6), ridge / 2.2)
-    y = bw * x
     ang = _line_angle(ax, x, x * 2, bw * x, bw * x * 2)
     off = 4 if above else -4
     dx, dy = -math.sin(math.radians(ang)) * off, math.cos(math.radians(ang)) * off
-    return ax.annotate(text, (x, y), xytext=(dx, dy), textcoords="offset points", rotation=ang,
-                       rotation_mode="anchor", ha="center", va="bottom" if above else "top",
-                       fontsize=size, color=color, gid=gid)
+    label = ax.annotate(text, (x, bw * x), xytext=(dx, dy), textcoords="offset points", rotation=ang,
+                        rotation_mode="anchor", ha="center", va="bottom" if above else "top",
+                        fontsize=size, color=color, gid=gid)
+    # long labels: slide along the line until the whole label is inside the axes
+    renderer = ax.figure.canvas.get_renderer()
+    left = ax.get_window_extent(renderer).x0 + 2
+    for _ in range(30):
+        if label.get_window_extent(renderer).x0 >= left or x * 1.1 > ridge / 1.5:
+            break
+        x *= 1.1
+        label.xy = (x, bw * x)
+    return label
 
 
 def _draw_roofs(ax, roofs, xlim, ylim, theme, levels_used, renderer, dots=()):
@@ -1295,14 +1353,17 @@ def _draw_roofs(ax, roofs, xlim, ylim, theme, levels_used, renderer, dots=()):
     artists = []
     avoid = Obstacles()
     sets = [("all", "dram"), ("1", "dram")] + [(c, "l3") for c in ("all", "1") if "l3" in levels_used]
+    # read-only DRAM roofs only when a plotted baseline uses one and it differs from read + write
+    sets += [(c, "dram_read") for c in ("all", "1") if "dram_read" in levels_used
+             and roofs[c].get("dram_read") and roofs[c]["dram_read"] > 1.02 * (roofs[c]["dram"] or 0)]
     for cores, lvl in sets:
         r = roofs[cores]
         bw, pi = r.get(lvl), r["peak"]
         if not bw or not pi:
             continue
         x = x_all
-        if lvl == "l3" and r.get("dram"):
-            # past the DRAM ridge the L3 roof is the same flat line: stop there
+        if lvl in ("l3", "dram_read") and r.get("dram"):
+            # past the DRAM ridge this roof is the same flat line: stop there
             x = x_all[x_all <= pi / r["dram"]]
         y = np.minimum(pi, bw * x)
         avoid.add_line(ax, x, y)
@@ -1310,18 +1371,35 @@ def _draw_roofs(ax, roofs, xlim, ylim, theme, levels_used, renderer, dots=()):
             style = dict(color=theme["ink"], linewidth=2.4 if cores == "all" else 1.4,
                          linestyle="-" if cores == "all" else (0, (5, 3)),
                          alpha=1.0 if cores == "all" else 0.55)
+        elif lvl == "dram_read":
+            style = dict(color=theme["ink"], linewidth=1.5 if cores == "all" else 1.1,
+                         linestyle=(0, (7, 2.5, 1.5, 2.5)), alpha=0.75 if cores == "all" else 0.45)
         else:
             style = dict(color=theme["l3"], linewidth=1.3, linestyle=(0, (1, 2.2)),
                          alpha=0.9 if cores == "all" else 0.7)
         ax.plot(x, y, solid_capstyle="round", zorder=3, gid=f"roof-{cores}-{lvl}", **style)
         who = "all cores" if cores == "all" else "1 core"
         src = " (user)" if r.get(lvl + "_src") == "user" else ""
-        name = "DRAM" if lvl == "dram" else "L3"
+        name = {"dram": "DRAM", "dram_read": "DRAM read-only", "l3": "L3"}[lvl]
+        one = roofs["1"].get("dram")
+        if lvl == "dram" and one and r["dram"] and abs(roofs["all"]["dram"] - one) <= 0.15 * one:
+            # the two DRAM slopes nearly coincide: one label under both lines
+            if cores == "1":
+                continue
+            src1 = " (user)" if roofs["1"].get("dram_src") == "user" else ""
+            low = min(bw, one)
+            text = (f"DRAM {_fmt(bw)} GB/s{src}" if abs(bw - one) < 0.05 else
+                    f"DRAM {_fmt(bw)} GB/s{src} (1 core {_fmt(one)}{src1})")
+            artists.append(_slant_label(ax, text, low, xlim, ylim, pi / low, 0.24, above=False,
+                                        color=theme["ink2"], gid=f"rooflabel-{cores}-{lvl}"))
+            continue
         # all-core label above its line, 1-core below, so the two near-parallel slopes stay readable
-        frac = {("all", "dram"): 0.30, ("1", "dram"): 0.22, ("all", "l3"): 0.52, ("1", "l3"): 0.40}[(cores, lvl)]
+        frac = {("all", "dram"): 0.30, ("1", "dram"): 0.22, ("all", "l3"): 0.52, ("1", "l3"): 0.40,
+                # read-only labels go near the top of their slope, clear of the DRAM labels
+                ("all", "dram_read"): 0.95, ("1", "dram_read"): 0.85}[(cores, lvl)]
         artists.append(_slant_label(ax, f"{name} {_fmt(bw)} GB/s · {who}{src}", bw, xlim, ylim, pi / bw,
                                     frac, above=(cores == "all"),
-                                    color=theme["ink2"] if lvl == "dram" else theme["l3"],
+                                    color=theme["ink2"] if lvl != "l3" else theme["l3"],
                                     gid=f"rooflabel-{cores}-{lvl}"))
     # ridge points (DRAM roofs), drawn before the peak labels so those can avoid them
     for cores in ("all", "1"):
@@ -1609,12 +1687,12 @@ def class_figure(report, args, theme=LIGHT, all_points=None, gid_prefix="c"):
             b = r["best"]
             if b:
                 bg, fg = theme["pill"][b["bound"]]
-                panel.text(0.885, y, b["bound"], fontsize=8, color=fg, va="center", ha="right",
+                panel.text(0.855, y, b["bound"], fontsize=8, color=fg, va="center", ha="right",
                                   bbox=dict(boxstyle="round,pad=0.32,rounding_size=0.75", facecolor=bg,
                                             edgecolor="none"))
                 panel.text(1.0, y, f"{100 * b['pct']:.0f}%", fontsize=9.5, color=theme["ink"],
                            va="center", ha="right")
-                sub = f"{b['name']} · N={r['n']} · {b['level'].upper() if b['level'] == 'l3' else 'DRAM'}, " \
+                sub = f"{b['name']} · N={r['n']} · {LEVEL_NAMES[b['level']]}, " \
                       f"{'all cores' if b['cores'] == 'all' else '1 core'}"
             else:
                 sub = "no correct baseline"
@@ -1757,7 +1835,9 @@ def kernel_figure(res, report, args, theme=LIGHT):
                loc="lower right", bbox_to_anchor=(0.985, 0.1 / h), fontsize=8, frameon=False,
                labelcolor=theme["ink2"], ncol=1)
 
-    notes = footnotes(report, args)[:1] + [n for n in footnotes(report, args)[1:] if "Python" in n or "BLAS" in n]
+    notes = footnotes(report, args)[:1] + [n for n in footnotes(report, args)[1:]
+                                           if "Python" in n or "BLAS" in n
+                                           or ("read-only" in n and any(p["level"] == "dram_read" for p in pts))]
     for w in res["warnings"][:2]:
         notes.append("Warning: " + w[:150])
     _footer(fig, notes, theme, y0=0.12 / h)
@@ -1976,7 +2056,7 @@ def write_html(report, rows, out, args):
             role = "best" if p is r["best"] else "start" if p is r["start"] else ""
             points[p["gid"].split("-", 1)[1]] = dict(kernel=label, student=student, name=p["name"], role=role, n=r["n"],
                                     P=p["P"], AI=p["AI"], roof=p["roof"], pct=p["pct"], unit=unit,
-                                    level="L3" if p["level"] == "l3" else "DRAM",
+                                    level=LEVEL_NAMES[p["level"]],
                                     cores="all cores" if p["cores"] == "all" else "1 core",
                                     verdict=p["verdict"], parallel=p["parallel"], correct=p["correct"])
         chips.append(f'<button class="chip" data-k="k{ki}" aria-pressed="true"><i style="background:'
@@ -2044,7 +2124,8 @@ def parse_args(argv):
                    help="seconds for the whole run; no new file starts after this")
     p.add_argument("--remeasure", action="store_true", help="measure the machine again")
     p.add_argument("--peak-gflops", help="peak GFLOP/s: 1CORE[,ALL]")
-    p.add_argument("--bandwidth", help="DRAM GB/s: 1CORE[,ALL]")
+    p.add_argument("--bandwidth", help="DRAM GB/s, read + write: 1CORE[,ALL]")
+    p.add_argument("--read-bandwidth", help="DRAM GB/s, read only: 1CORE[,ALL]")
     p.add_argument("--l3-bandwidth", help="L3 GB/s: 1CORE[,ALL]")
     p.add_argument("--l3-mb", type=float, help="L3 size of ONE instance in MB (e.g. 32 on a 5900X)")
     p.add_argument("--peak-source", choices=["measured", "theoretical"], default="measured")
