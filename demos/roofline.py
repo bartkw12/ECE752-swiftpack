@@ -128,6 +128,11 @@ KERNELS = {
 
 LEVEL_NAMES = {"dram": "DRAM", "dram_read": "DRAM read-only", "l3": "L3"}
 
+# Numba falls back to its simple 'workqueue' layer when neither OpenMP nor TBB is installed
+# - Seen on a fresh Ubuntu (WSL): nested prange baselines (correlation, syrk) ran past 900 s.
+WORKQUEUE_NOTE = ("Numba ran on its 'workqueue' threading layer (no OpenMP or TBB found), so parallel "
+                  "baselines are slower than usual; on Linux, installing libgomp1 enables OpenMP.")
+
 PAR_RE = re.compile(r"(^|_)par(allel)?(_|$)", re.IGNORECASE)
 FAMILY_RE = re.compile(r"^v?(\d+)_")
 
@@ -816,8 +821,9 @@ def build_roofs(machine, args):
         if not roofs[c]["dram"]:
             roofs[c]["dram"] = roofs["1" if c == "all" else "all"]["dram"]
     for c in ("1", "all"):
-        # a read-only kernel can always do at least what the read + write stream does
-        if roofs[c]["dram"] and (roofs[c]["dram_read"] or 0) < roofs[c]["dram"]:
+        # a read-only kernel can always do at least what the read + write stream does;
+        # within 15% the two are treated as one roof (one line, one label)
+        if roofs[c]["dram"] and (roofs[c]["dram_read"] or 0) < 1.15 * roofs[c]["dram"]:
             roofs[c]["dram_read"], roofs[c]["dram_read_src"] = roofs[c]["dram"], roofs[c]["dram_src"]
     roofs["l3_instance_mb"] = machine.get("l3_instance_mb")
     roofs["l3_total_mb"] = machine.get("l3_total_mb")
@@ -1130,6 +1136,8 @@ def footnotes(report, args):
     if not args.include_python:
         notes.append("Python baselines hidden (--include-python).")
     notes.append("BLAS limited to 1 thread, so library baselines can read lower than students' own tables.")
+    if any(r["run"].get("threading_layer") == "workqueue" for r in report["results"]):
+        notes.append(WORKQUEUE_NOTE)
     srcs = {report["roofs"][c][f] for c in ("1", "all") for f in ("peak_src", "dram_src")}
     notes.append("Peak and bandwidth " + ("set by the user (user)." if srcs == {"user"} else
                                           "measured on this machine." if "user" not in srcs else
@@ -1530,8 +1538,9 @@ def _subtitle(report, sizes):
     parts = [m.get("cpu", "unknown CPU")]
     if m.get("physical_alloc"):
         parts.append(f"{m['physical_alloc']} cores / {m.get('allocated_cpus')} threads")
+    layers = sorted({r["run"].get("threading_layer") for r in report["results"]} - {None})
     if nt:
-        parts.append(f"Numba threads {nt}")
+        parts.append(f"Numba threads {nt}" + (f" ({', '.join(layers)})" if layers else ""))
     parts.append(datetime.date.today().isoformat())
     if sizes:
         parts.append("N: " + ", ".join(sizes))
@@ -1571,7 +1580,9 @@ def class_figure(report, args, theme=LIGHT, all_points=None, gid_prefix="c"):
         elif args.include_python:
             pts += [p for p in r["points"] if p["python"]]
     xlim, ylim = _limits(pts, roofs)
-    ax = fig.add_axes([0.065, 0.20, 0.615, 0.66])
+    # more than five footnotes: lift the plot so the footer clears the x-axis label
+    lift = 0.024 * max(0, len(footnotes(report, args)) - 5)
+    ax = fig.add_axes([0.065, 0.20 + lift, 0.615, 0.66 - lift])
     _style_axes(ax, theme, xlim, ylim)
 
     # memory-bound / compute-bound background, split at the all-core ridge
@@ -1663,7 +1674,7 @@ def class_figure(report, args, theme=LIGHT, all_points=None, gid_prefix="c"):
     fig.text(0.04, 0.945, sub, fontsize=10.5, color=theme["muted"], ha="left", va="top", linespacing=1.4)
 
     # right panel: one row per kernel
-    panel = fig.add_axes([0.715, 0.20, 0.265, 0.66])
+    panel = fig.add_axes([0.715, 0.20 + lift, 0.265, 0.66 - lift])
     panel.set_xlim(0, 1)
     panel.set_ylim(0, 1)
     panel.axis("off")
@@ -1724,11 +1735,15 @@ def kernel_figure(res, report, args, theme=LIGHT):
     roofs = report["roofs"]
     entry = KERNELS.get(res["kernel"], {})
     by_perf = sorted(pts, key=lambda p: p["P"], reverse=True)
+    notes = footnotes(report, args)[:1] + [n for n in footnotes(report, args)[1:]
+                                           if "Python" in n or "BLAS" in n or "workqueue" in n
+                                           or ("read-only" in n and any(p["level"] == "dram_read" for p in pts))]
+    notes += ["Warning: " + w[:150] for w in res["warnings"][:2]]
     h = max(7.5, 2.2 + 0.19 * len(by_perf))
     fig = _new_figure(13, h, theme)
     renderer = fig.canvas.get_renderer()
     top = 1 - 0.95 / h * 1.25
-    bottom = 1.25 / h
+    bottom = (0.75 + 0.17 * len(notes)) / h     # room for the x-axis label and the footer
     xlim, ylim = _limits(pts, roofs)
     ax = fig.add_axes([0.065, bottom, 0.56, top - bottom])
     _style_axes(ax, theme, xlim, ylim)
@@ -1835,11 +1850,6 @@ def kernel_figure(res, report, args, theme=LIGHT):
                loc="lower right", bbox_to_anchor=(0.985, 0.1 / h), fontsize=8, frameon=False,
                labelcolor=theme["ink2"], ncol=1)
 
-    notes = footnotes(report, args)[:1] + [n for n in footnotes(report, args)[1:]
-                                           if "Python" in n or "BLAS" in n
-                                           or ("read-only" in n and any(p["level"] == "dram_read" for p in pts))]
-    for w in res["warnings"][:2]:
-        notes.append("Warning: " + w[:150])
     _footer(fig, notes, theme, y0=0.12 / h)
     return fig
 
@@ -2119,8 +2129,10 @@ def parse_args(argv):
     p.add_argument("--include-python", action="store_true", help="show the pure-Python baselines")
     p.add_argument("--html", action="store_true", help="also write roofline.html")
     p.add_argument("--show", action="store_true", help="open the chart window at the end")
-    p.add_argument("--timeout", type=float, default=900, help="seconds per bench file")
-    p.add_argument("--budget", type=float, default=2400,
+    # - every kernel finishes in under 160 s on the 5900X, so 600 s is ample headroom
+    # - 2100 s leaves 10 of SLURM's 45 minutes for run_bench.sh's venv setup and matmul run
+    p.add_argument("--timeout", type=float, default=600, help="seconds per bench file")
+    p.add_argument("--budget", type=float, default=2100,
                    help="seconds for the whole run; no new file starts after this")
     p.add_argument("--remeasure", action="store_true", help="measure the machine again")
     p.add_argument("--peak-gflops", help="peak GFLOP/s: 1CORE[,ALL]")
@@ -2175,6 +2187,7 @@ def main(argv=None):
     machine = load_machine(out, args, need_measure=True)
     kernels = {kernel_key(f) for f in files} if explicit else None
     detail = set()
+    warned_workqueue = False
     print(f"\nRunning {len(files)} bench file(s); budget {args.budget:.0f} s, timeout {args.timeout:.0f} s each.")
     for i, path in enumerate(files, 1):
         key = kernel_key(path)
@@ -2197,6 +2210,9 @@ def main(argv=None):
             run["roofs_measured"] = machine.get("measured")
             merge_run(data, run)
             print(f"{label}: done in {time.time() - t0:.0f} s, {len(run['rows'])} baselines")
+            if run.get("threading_layer") == "workqueue" and not warned_workqueue:
+                print("    warning: " + WORKQUEUE_NOTE)
+                warned_workqueue = True
             for w in run["warnings"]:
                 print(f"    warning: {w}")
             if per_kernel:
