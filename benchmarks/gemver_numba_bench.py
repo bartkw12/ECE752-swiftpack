@@ -1127,6 +1127,222 @@ def gemver_blas_18(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 
 
 # ---------------------------------------------------------
+# Baseline 19: Full fusion of all 4 stages by column panels (+ micro-kernel)
+# - Baseline 11/17: S4 needs the FINAL x, so it waits for every row -> 3rd pass over A.
+# - But column j's part of S4 only needs x[j], and x[j] is final once
+#   column j has been seen by every row. So walk A in column panels:
+#     1. pass 1 over the panel: S1 + S2 for columns [jb, je)   (A from DRAM)
+#     2. S3 for the panel: x[jb:je] += z[jb:je]                 (x[jb:je] final)
+#     3. pass 2 over the SAME panel: w += alpha * A[:, jb:je] x[jb:je]
+#        (the panel was just touched -> it should come from L3, not DRAM)
+# - DRAM traffic: read A once + write A once = 2 passes (11/17: 3).
+#   2 is the minimum: A is an output, so it must be read and written once.
+# - Legal: S2 uses only updated A in its panel; S4 uses only final x and A.
+#   w is summed panel by panel -> different rounding order (fine at 1e-5).
+# - Panel width PW: the panel (N x PW x 8 bytes) must stay in L3 until pass 2.
+# - Three versions:
+#     - 19_fused_panel:     1 row at a time (fusion only)
+#     - 19_fused_panel_mk:  4-row micro-kernel from 17 inside each panel
+#     - 19_fused_panel_par: threads split the ROWS of each panel
+# - Row slices A[i, jb:je] + a local j index: this form vectorizes (AVX2 FMAs);
+#   indexing A[i, j] with j in range(jb, je) did not (3x slower in a first test).
+# - Observed (5900X), N=4096, median of interleaved runs (17 = 15.6 ms):
+#     - 19_mk vs panel width: 512 -> 17.1 ms, 1024 -> 14.8, 2048 -> 13.8,
+#       4096 (one panel, so S4 is NOT fused) -> 13.0. Narrower is slower.
+#     - Why panels do not pay off here:
+#         - pass 1 on 4 KB row pieces is slower than on full rows (11.0 vs 9.3 ms)
+#         - pass 2 is not fully served from L3 (the 16.8 MB panel gets partly evicted)
+#     - 19_fused_panel (no micro-kernel) at PW=512: 21.3 ms -> the micro-kernel matters.
+#     - 19_fused_panel_par: 13.4 ms at 8-12 threads, 14.3 ms at 24
+#       (17_par: 13.8 ms at 2 threads, 19.7 ms at 24).
+#     - Tried and not kept: PW as a compile-time constant (closure in a factory).
+#       Numba still calls the generic helpers (same asm); writing the loops inline
+#       with a fixed trip count was slower (20.6 vs 17.1 ms).
+# - Side finding: 19_mk with one panel does 17's work but is faster (13.0 vs 15.6 ms).
+#   Baseline 17 calls its helper with fixed bounds (0, n); the compiler specializes
+#   the inlined copy and it gets slower (S1+S2 alone: 10.7 ms vs 9.2 ms when the
+#   bounds are runtime values). More compile-time knowledge is not always faster.
+# ---------------------------------------------------------
+L3_BYTES = 32 * 1024 * 1024     # one CCD's L3, the most one core can use
+PANEL_WIDTH = 512               # default for N=4096 (4096 x 512 x 8 B = 16.8 MB)
+
+def default_panel_width(n):
+    # - Largest power of two with N x PW x 8 bytes <= L3 / 2, and PW <= N.
+    # - Half the L3: leaves room for x, w and the other vectors.
+    pw = 8
+    while 2 * pw <= n and n * (2 * pw) * 8 <= L3_BYTES // 2:
+        pw *= 2
+    return pw
+
+
+@njit(fastmath=True)
+def _panel_s12_rows1(beta, A, u1, v1, u2, v2, y, xp, jb, je, row_start, row_end):
+    # - S1+S2 on columns [jb, je) for rows [row_start, row_end), one row at a time
+    # - xp: the x entries of this panel (x[jb:je], or a thread's private copy)
+    m = je - jb
+    v1p = v1[jb:je]
+    v2p = v2[jb:je]
+    for i in range(row_start, row_end):
+        r = A[i, jb:je]
+        a1 = u1[i]
+        a2 = u2[i]
+        c = beta * y[i]
+        for j in range(m):
+            a = r[j] + a1 * v1p[j] + a2 * v2p[j]
+            r[j] = a
+            xp[j] += c * a
+
+
+@njit(fastmath=True)
+def _panel_s4_rows1(alpha, A, x, w, jb, je, row_start, row_end):
+    # - S4 part for columns [jb, je): w[i] += alpha * A[i, jb:je] . x[jb:je]
+    m = je - jb
+    xp = x[jb:je]
+    for i in range(row_start, row_end):
+        r = A[i, jb:je]
+        s = 0.0
+        for j in range(m):
+            s += r[j] * xp[j]
+        w[i] += alpha * s
+
+
+@njit(fastmath=True)
+def _panel_s12_rows4(beta, A, u1, v1, u2, v2, y, xp, jb, je, row_start, row_end):
+    # - Micro-kernel: same as 17's _fused_rows_4, but only on columns [jb, je)
+    #     - v1[j], v2[j] loaded once for 4 rows; xp[j] loaded/stored once per 4 rows
+    m = je - jb
+    v1p = v1[jb:je]
+    v2p = v2[jb:je]
+    i = row_start
+    while i + 4 <= row_end:
+        r0 = A[i, jb:je]
+        r1 = A[i + 1, jb:je]
+        r2 = A[i + 2, jb:je]
+        r3 = A[i + 3, jb:je]
+        a10 = u1[i]
+        a11 = u1[i + 1]
+        a12 = u1[i + 2]
+        a13 = u1[i + 3]
+        a20 = u2[i]
+        a21 = u2[i + 1]
+        a22 = u2[i + 2]
+        a23 = u2[i + 3]
+        c0 = beta * y[i]
+        c1 = beta * y[i + 1]
+        c2 = beta * y[i + 2]
+        c3 = beta * y[i + 3]
+        for j in range(m):
+            p = v1p[j]
+            q = v2p[j]
+            e0 = r0[j] + a10 * p + a20 * q
+            e1 = r1[j] + a11 * p + a21 * q
+            e2 = r2[j] + a12 * p + a22 * q
+            e3 = r3[j] + a13 * p + a23 * q
+            r0[j] = e0
+            r1[j] = e1
+            r2[j] = e2
+            r3[j] = e3
+            xp[j] += c0 * e0 + c1 * e1 + c2 * e2 + c3 * e3
+        i += 4
+    # leftover rows (fewer than 4)
+    _panel_s12_rows1(beta, A, u1, v1, u2, v2, y, xp, jb, je, i, row_end)
+
+
+@njit(fastmath=True)
+def _panel_s4_rows4(alpha, A, x, w, jb, je, row_start, row_end):
+    # - Micro-kernel: x[j] loaded once, used for 4 rows; 4 independent sums
+    m = je - jb
+    xp = x[jb:je]
+    i = row_start
+    while i + 4 <= row_end:
+        r0 = A[i, jb:je]
+        r1 = A[i + 1, jb:je]
+        r2 = A[i + 2, jb:je]
+        r3 = A[i + 3, jb:je]
+        s0 = 0.0
+        s1 = 0.0
+        s2 = 0.0
+        s3 = 0.0
+        for j in range(m):
+            xj = xp[j]
+            s0 += r0[j] * xj
+            s1 += r1[j] * xj
+            s2 += r2[j] * xj
+            s3 += r3[j] * xj
+        w[i] += alpha * s0
+        w[i + 1] += alpha * s1
+        w[i + 2] += alpha * s2
+        w[i + 3] += alpha * s3
+        i += 4
+    _panel_s4_rows1(alpha, A, x, w, jb, je, i, row_end)
+
+
+@njit(fastmath=True)
+def gemver_fused_panel_19(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, pw=PANEL_WIDTH):
+    # - Fusion only (1-row helpers): isolates the effect of the panel order
+    n = A.shape[0]
+    for jb in range(0, n, pw):
+        je = min(jb + pw, n)            # last panel = cleanup panel (n % pw columns)
+        _panel_s12_rows1(beta, A, u1, v1, u2, v2, y, x[jb:je], jb, je, 0, n)
+        for j in range(jb, je):
+            x[j] = x[j] + z[j]
+        _panel_s4_rows1(alpha, A, x, w, jb, je, 0, n)
+
+
+@njit(fastmath=True)
+def gemver_fused_panel_mk_19(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, pw=PANEL_WIDTH):
+    # - Fusion + 4-row micro-kernel (the professor's "micro-kernel on fused code")
+    n = A.shape[0]
+    for jb in range(0, n, pw):
+        je = min(jb + pw, n)
+        # pass 1: S1+S2 on the panel (A comes from DRAM)
+        _panel_s12_rows4(beta, A, u1, v1, u2, v2, y, x[jb:je], jb, je, 0, n)
+        # S3: x[jb:je] is now final
+        for j in range(jb, je):
+            x[j] = x[j] + z[j]
+        # pass 2: S4 on the same panel (A should come from L3)
+        _panel_s4_rows4(alpha, A, x, w, jb, je, 0, n)
+
+
+@njit(parallel=True, fastmath=True)
+def gemver_fused_panel_par_19(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, pw=PANEL_WIDTH):
+    # - Panels in order; threads split the ROWS of each panel
+    #     - pass 1: all threads add into x[jb:je] -> race -> private partial x per
+    #       thread (only pw long), summed after pass 1 (same idea as Baseline 12)
+    #     - pass 2: each thread owns its rows of w -> no race on w
+    #     - a thread re-reads in pass 2 the rows it wrote in pass 1 (its own cache)
+    # - Other split tried (each thread takes whole column panels, private w):
+    #   slower (best 14.6 ms vs 13.4 ms); narrow panels per thread = short row pieces.
+    n = A.shape[0]
+    num_chunks = get_num_threads()
+    chunk = ((n + num_chunks - 1) // num_chunks + 3) // 4 * 4    # multiple of 4 rows
+    partial = np.zeros((num_chunks, pw), dtype=A.dtype)
+
+    for jb in range(0, n, pw):
+        je = min(jb + pw, n)
+        m = je - jb
+
+        for t in prange(num_chunks):
+            row_start = min(t * chunk, n)
+            row_end = min(row_start + chunk, n)
+            xp = partial[t, :m]
+            xp[:] = 0.0
+            _panel_s12_rows4(beta, A, u1, v1, u2, v2, y, xp, jb, je, row_start, row_end)
+
+        # sum the partial x's, then S3 -> x[jb:je] final
+        for j in range(m):
+            s = x[jb + j] + z[jb + j]
+            for t in range(num_chunks):
+                s += partial[t, j]
+            x[jb + j] = s
+
+        for t in prange(num_chunks):
+            row_start = min(t * chunk, n)
+            row_end = min(row_start + chunk, n)
+            _panel_s4_rows4(alpha, A, x, w, jb, je, row_start, row_end)
+
+
+# ---------------------------------------------------------
 # Memory Bandwidth Reference (not a GEMVER baseline)
 # - Measures how fast this machine can stream data from DRAM.
 # - Kernel a = a + s*b: reads a, reads b, writes a (3 x 8 bytes per element).
@@ -1184,14 +1400,18 @@ def measure_bandwidth(reps=10):
 # - Unfused: stage 1 read + stage 1 write + stage 2 read + stage 4 read = 4.
 # - Fused (11, 12, 16, 17): stage 2 reuses A while it is in a register = 3.
 # - BLAS (18): dgemm read + write, then 2 dgemv reads = 4 (the default below).
+# - Column panels (19): read + write from DRAM, pass 2 from L3 = 2
+#   (the ideal; it holds only while the panel stays in L3).
 def gemver_passes_over_A(name):
+    if name.startswith("19_"):
+        return 2
     fused = ("11_", "12_", "16_", "17_")
     return 3 if name.startswith(fused) else 4
 
 
 # Roofline hook (used by demos/roofline.py)
 # - Bytes moved = passes over A x 8 bytes x N^2 (vectors are O(N), ignored).
-# - Unfused baselines read/write A 4 times, fused ones 3 times.
+# - Unfused baselines read/write A 4 times, fused ones 3 times, panels (19) 2 times.
 def roofline_bytes(name, n):
     return gemver_passes_over_A(name) * 8.0 * n * n
 
@@ -1282,9 +1502,15 @@ BLAS_MT_ROWS = (
     "17_fused_unroll_jam",
     "17_fused_unroll_jam_par",
     "18_blas",
+    "19_fused_panel_mk",
+    "19_fused_panel_par",
 )
 
-def run_benchmark(vector_size=DEFAULT_N, blas_mt=False):
+def run_benchmark(vector_size=DEFAULT_N, blas_mt=False, pw=None):
+    # pw: panel width for Baseline 19 (None = default_panel_width(N), or --pw on the command line)
+    if pw is None:
+        pw = default_panel_width(vector_size)
+
     (
         A_initial,
         u1,
@@ -1314,28 +1540,29 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False):
 
     total_flops = gemver_flop_count(vector_size)
 
-    def run_once(fn):
+    def run_once(fn, extra=()):
         """
         Run fn on fresh copies of A, x, and w (GEMVER updates them in place)
         and return the elapsed kernel time along with the result arrays.
+        extra: arguments after z (Baseline 19's panel width).
         """
         A = A_initial.copy()
         x = x_initial.copy()
         w = w_initial.copy()
 
         start = time.perf_counter()
-        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z)
+        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
         elapsed = time.perf_counter() - start
 
         return elapsed, A, x, w
 
-    def measure(fn, warmup=True, min_reps=9, min_time=0.3, max_reps=200):
+    def measure(fn, extra=(), warmup=True, min_reps=9, min_time=0.3, max_reps=200):
         # Warm-up call triggers Numba JIT compilation, so it is not timed.
         if warmup:
-            run_once(fn)
+            run_once(fn, extra)
 
         # Correctness check against the NumPy reference results
-        _, A, x, w = run_once(fn)
+        _, A, x, w = run_once(fn, extra)
         is_correct = (
             np.allclose(A, A_expected, rtol=1e-5, atol=1e-5)
             and np.allclose(x, x_expected, rtol=1e-5, atol=1e-5)
@@ -1347,7 +1574,7 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False):
         # (short N=512 runs are noisy; the median ignores outliers).
         times = []
         while len(times) < min_reps or (sum(times) < min_time and len(times) < max_reps):
-            times.append(run_once(fn)[0])
+            times.append(run_once(fn, extra)[0])
         elapsed = float(np.median(times))
         gflops = (total_flops / elapsed) / 1e9
 
@@ -1384,15 +1611,19 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False):
         ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
         ("17_fused_unroll_jam_par", gemver_fused_unroll_jam_parallel_17),
         ("18_blas", gemver_blas_18),
+        # third element: extra arguments after z (the panel width)
+        ("19_fused_panel", gemver_fused_panel_19, (pw,)),
+        ("19_fused_panel_mk", gemver_fused_panel_mk_19, (pw,)),
+        ("19_fused_panel_par", gemver_fused_panel_par_19, (pw,)),
     ]
 
     # blas_mt mode: small table, and the BLAS row is renamed to show its threads
     if blas_mt:
-        functions = [("18_blas_mt" if name == "18_blas" else name, fn)
-                     for name, fn in functions if name in BLAS_MT_ROWS]
+        functions = [("18_blas_mt" if entry[0] == "18_blas" else entry[0],) + tuple(entry[1:])
+                     for entry in functions if entry[0] in BLAS_MT_ROWS]
 
-    for name, fn in functions:
-        gflops, elapsed, is_correct = measure(fn)
+    for name, fn, *extra in functions:
+        gflops, elapsed, is_correct = measure(fn, tuple(extra[0]) if extra else ())
         results.append((name, gflops, elapsed, is_correct))
 
     return results
@@ -1418,7 +1649,10 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False):
 #   too noisy (1.2x and 2.7x for the same setting), so no conclusion drawn.
 THREAD_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24]
 
-def run_thread_sweep(vector_size=DEFAULT_N):
+def run_thread_sweep(vector_size=DEFAULT_N, pw=None):
+    if pw is None:
+        pw = default_panel_width(vector_size)
+
     (
         A_initial,
         u1,
@@ -1449,26 +1683,26 @@ def run_thread_sweep(vector_size=DEFAULT_N):
     max_threads = get_num_threads()
     thread_counts = [t for t in THREAD_COUNTS if t <= max_threads]
 
-    def run_once(fn):
+    def run_once(fn, extra=()):
         A = A_initial.copy()
         x = x_initial.copy()
         w = w_initial.copy()
 
         start = time.perf_counter()
-        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z)
+        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
         elapsed = time.perf_counter() - start
 
         return elapsed, A, x, w
 
-    def measure(fn, min_reps=9, min_time=0.3, max_reps=200):
+    def measure(fn, extra=(), min_reps=9, min_time=0.3, max_reps=200):
         # Warm-up call: compiles on first use and starts the thread pool.
-        run_once(fn)
+        run_once(fn, extra)
 
         # Repeat until enough time has been measured, then take the median,
         # which is less sensitive to outliers than the mean for short kernels.
         times = []
         while len(times) < min_reps or (sum(times) < min_time and len(times) < max_reps):
-            elapsed, A, x, w = run_once(fn)
+            elapsed, A, x, w = run_once(fn, extra)
             times.append(elapsed)
 
         is_correct = (
@@ -1490,14 +1724,15 @@ def run_thread_sweep(vector_size=DEFAULT_N):
         ("5_blocked_parallel", gemver_blocked_parallel_5),
         ("12_fused_parallel", gemver_fused_parallel_12),
         ("17_fused_unroll_jam_par", gemver_fused_unroll_jam_parallel_17),
+        ("19_fused_panel_par", gemver_fused_panel_par_19, (pw,)),
     ]
 
     results = []
-    for name, fn in kernels:
+    for name, fn, *extra in kernels:
         rows = []
         for t in thread_counts:
             set_num_threads(t)
-            gflops, elapsed, is_correct = measure(fn)
+            gflops, elapsed, is_correct = measure(fn, tuple(extra[0]) if extra else ())
             rows.append((t, gflops, elapsed, is_correct))
         results.append((name, rows))
 
@@ -1506,11 +1741,11 @@ def run_thread_sweep(vector_size=DEFAULT_N):
     return thread_counts, serial, results
 
 
-def report_thread_sweep(vector_size):
+def report_thread_sweep(vector_size, pw=None, image_path=None):
     print(f"\nRunning GEMVER Thread-Count Sweep for N={vector_size}...")
     print(f"CPU: {CPU_NAME}\n")
 
-    thread_counts, serial, results = run_thread_sweep(vector_size)
+    thread_counts, serial, results = run_thread_sweep(vector_size, pw)
     serial_gflops, serial_elapsed, serial_correct = serial
 
     print(f"Numba threading layer: {threading_layer()}\n")
@@ -1558,8 +1793,8 @@ def report_thread_sweep(vector_size):
         print(divider)
 
     # Plotting Output: throughput (left) and self-relative speedup (right)
-    colors = ["#2a78d6", "#eb6834", "#1baf7a", "#8e5cd9"]
-    markers = ["o", "s", "^", "D"]
+    colors = ["#2a78d6", "#eb6834", "#1baf7a", "#8e5cd9", "#d6336c"]
+    markers = ["o", "s", "^", "D", "v"]
     muted = "#898781"
 
     fig, (ax_gflops, ax_speedup) = plt.subplots(1, 2, figsize=(16, 6))
@@ -1599,7 +1834,18 @@ def report_thread_sweep(vector_size):
 
     fig.suptitle(f"Numba GEMVER Thread-Count Sweep (N={vector_size})\nCPU: {CPU_NAME}")
     plt.tight_layout()
-    plt.show()
+    save_or_show(image_path)
+
+
+def save_or_show(image_path):
+    # - With a .png path: save the PNG, no window (works on a server with no display).
+    # - Without: show the window, as in the live walkthrough.
+    if image_path:
+        os.makedirs(os.path.dirname(image_path) or ".", exist_ok=True)
+        plt.savefig(image_path, dpi=300)
+        print(f"Plot saved to {image_path}")
+    else:
+        plt.show()
 
 
 # ---------------------------------------------------------
@@ -1612,12 +1858,15 @@ def report_thread_sweep(vector_size):
 #     - "loads of u1/u2/y in hot loop" is not counted directly; compare the
 #       total size of 11 vs 16 instead (same size -> the compiler hoisted).
 # - Full assembly is written to asm/<name>.s so it can be opened and shown.
+# - Third element: helpers where the work happens (their assembly is included).
 ASM_KERNELS = [
     ("1_numba_naive", gemver_numba_1),
     ("3_fastmath_ij_ji_ij", gemver_opt_flags_3),
     ("11_fused_fastmath", gemver_fused_11),
     ("16_no_hoist", gemver_no_hoist_16),
-    ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
+    ("17_fused_unroll_jam", gemver_fused_unroll_jam_17, (_fused_rows_4, _matvec_rows_4)),
+    ("19_fused_panel", gemver_fused_panel_19, (_panel_s12_rows1, _panel_s4_rows1)),
+    ("19_fused_panel_mk", gemver_fused_panel_mk_19, (_panel_s12_rows4, _panel_s4_rows4)),
 ]
 
 def report_asm(vector_size):
@@ -1626,13 +1875,11 @@ def report_asm(vector_size):
     os.makedirs("asm", exist_ok=True)
     print(f"\n{'Kernel':<24} | {'vector FMA (ymm)':>16} | {'scalar add/FMA':>14} | {'instructions':>12}")
     print("-" * 76)
-    for name, fn in ASM_KERNELS:
+    for name, fn, *helpers in ASM_KERNELS:
         fn(ALPHA, BETA, A.copy(), u1, v1, u2, v2, w.copy(), x.copy(), y, z)  # compile
         asm = "\n".join(fn.inspect_asm().values())
-        if name.startswith("17_"):
-            # the work happens in the two helpers, so include them
-            for helper in (_fused_rows_4, _matvec_rows_4):
-                asm += "\n".join(helper.inspect_asm().values())
+        for helper in (helpers[0] if helpers else ()):
+            asm += "\n".join(helper.inspect_asm().values())
         with open(os.path.join("asm", name + ".s"), "w") as fh:
             fh.write(asm)
         code = [l for l in asm.splitlines() if l.startswith("\t") and not l.startswith("\t.")]
@@ -1645,19 +1892,29 @@ def report_asm(vector_size):
 # ---------------------------------------------------------
 # Formatting and Output Execution
 # ---------------------------------------------------------
-# Command line: python gemver_numba_bench.py [N] [mode words] [image.png]
+# Command line: python gemver_numba_bench.py [N] [mode words] [image.png] [--pw W]
 # - N: matrix size (default 512).
 # - Mode words (any order): threads, asm, blas_mt.
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
+# - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
 MODES = ("threads", "asm", "blas_mt")
 
 def parse_args(argv):
     n = DEFAULT_N
     modes = set()
     image_path = None
-    for arg in argv:
-        if arg.lower().endswith(".png"):
+    pw = None
+    args = list(argv)
+    while args:
+        arg = args.pop(0)
+        if arg == "--pw" or arg.startswith("--pw="):
+            value = arg.split("=", 1)[1] if "=" in arg else (args.pop(0) if args else "")
+            if value.isdigit() and int(value) > 0:
+                pw = int(value)
+            else:
+                print(f"Ignoring --pw '{value}': expected a positive integer.")
+        elif arg.lower().endswith(".png"):
             image_path = arg
         elif arg in MODES:
             modes.add(arg)
@@ -1672,15 +1929,16 @@ def parse_args(argv):
                 n = value
             else:
                 print(f"Invalid vector size. Using the default N={DEFAULT_N}.")
-    return n, modes, image_path
+    return n, modes, image_path, pw
 
 
 if __name__ == "__main__":
-    N_input, modes, image_path = parse_args(sys.argv[1:])
+    N_input, modes, image_path, pw_input = parse_args(sys.argv[1:])
+    pw = pw_input if pw_input is not None else default_panel_width(N_input)
 
     # A mode word selects a sweep instead of the baseline table.
     if "threads" in modes:
-        report_thread_sweep(N_input)
+        report_thread_sweep(N_input, pw, image_path)
         sys.exit(0)
     if "asm" in modes:
         report_asm(N_input)
@@ -1690,9 +1948,12 @@ if __name__ == "__main__":
           f"{' (blas_mt: multi-threaded BLAS, short table)' if BLAS_MT else ''}...")
     print(f"CPU: {CPU_NAME}")
     print(f"Numba threads: {get_num_threads()}")
-    print(blas_info() + "\n")
+    print(blas_info())
+    print(f"Baseline 19 panel width: {pw} columns "
+          f"({'--pw' if pw_input is not None else 'default'}; "
+          f"panel = N x PW x 8 B = {N_input * pw * 8 / 1e6:.1f} MB, L3 = {L3_BYTES / 1e6:.1f} MB)\n")
 
-    benchmark_data = run_benchmark(N_input, blas_mt=BLAS_MT)
+    benchmark_data = run_benchmark(N_input, blas_mt=BLAS_MT, pw=pw)
 
     # The threading layer is only chosen once a parallel function has run.
     print(f"Numba threading layer: {threading_layer()}\n")
@@ -1783,11 +2044,4 @@ if __name__ == "__main__":
     plt.tight_layout()
 
     # Optional image path (same as upstream matmul / run_bench.sh)
-    # - With a .png path: save the PNG, no window (works on a server with no display).
-    # - Without: show the window, as in the live walkthrough.
-    if image_path:
-        os.makedirs(os.path.dirname(image_path) or ".", exist_ok=True)
-        plt.savefig(image_path, dpi=300)
-        print(f"Plot saved to {image_path}")
-    else:
-        plt.show()
+    save_or_show(image_path)
