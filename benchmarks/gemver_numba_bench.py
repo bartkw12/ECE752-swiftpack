@@ -982,6 +982,8 @@ def gemver_no_hoist_16(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 #   traffic does not change. Expect a gain at N=512, little at N=4096.
 # - The parallel version gives each thread a chunk of rows and a private
 #   partial x (same race-free scheme as Baseline 12).
+# - The serial kernel calls the helpers with the constant start row 0, which
+#   makes LLVM pick a slower (scalar) path. Fixed in Baseline 17b below.
 # ---------------------------------------------------------
 @njit(fastmath=True)
 def _fused_rows_4(beta, A, u1, v1, u2, v2, y, xout, row_start, row_end):
@@ -1090,6 +1092,38 @@ def gemver_fused_unroll_jam_parallel_17(alpha, beta, A, u1, v1, u2, v2, w, x, y,
 
 
 # ---------------------------------------------------------
+# Baseline 17b: Baseline 17 with the start row passed in at run time
+# - Same code as 17. Only change: the start row is an argument (the benchmark
+#   passes 0) instead of the constant 0 written in the kernel.
+# - Why that matters (found while testing Baseline 19):
+#     - The 4-row loop writes 4 rows of A and x. To use SIMD, LLVM must know
+#       they do not overlap in memory, so it adds a runtime check:
+#       overlap -> scalar loop, no overlap -> SIMD loop.
+#     - Start row known (0): LLVM hoists the check out of the row loop and runs
+#       it ONCE for all rows. Row i (over all i) and row i+1 (over all i) cover
+#       almost the same memory -> check says "overlap" -> scalar loop, every time.
+#     - Start row unknown: the check stays per 4-row block -> passes -> SIMD.
+# - Proof (5900X, S1+S2 alone, N=512, A in cache):
+#     - constant 0: 124 us; start row as argument: 41 us (3x faster)
+#     - constant 0 with LLVM option -hoist-runtime-checks=false: 37 us
+# - Expect: clear gain at N=512 (compute matters), smaller at N=4096
+#   (waiting on DRAM hides most of the scalar slowdown).
+# - Observed (5900X, 17 vs 17b, alternating runs):
+#     - N=512:  0.21 -> 0.18 ms (1.2x)
+#     - N=4096: 1.04x-1.13x (the main table's +-10% noise can hide it)
+# - 17_par was never affected: its row bounds are computed at run time.
+# - Lesson: more compile-time knowledge is not always faster.
+# ---------------------------------------------------------
+@njit(fastmath=True)
+def gemver_fused_unroll_jam_17b(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, row_start):
+    n = A.shape[0]
+    _fused_rows_4(beta, A, u1, v1, u2, v2, y, x, row_start, n)
+    for i in range(n):
+        x[i] = x[i] + z[i]
+    _matvec_rows_4(alpha, A, x, w, row_start, n)
+
+
+# ---------------------------------------------------------
 # Baseline 18: Optimized library baseline (direct BLAS, in place)
 # - The "np.dot of GEMVER": vendor BLAS for every stage (matmul compares to np.dot).
 # - GEMVER itself is not a routine in OpenBLAS or MKL (only in the 2001 BLAS
@@ -1159,9 +1193,7 @@ def gemver_blas_18(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 #       Numba still calls the generic helpers (same asm); writing the loops inline
 #       with a fixed trip count was slower (20.6 vs 17.1 ms).
 # - Side finding: 19_mk with one panel does 17's work but is faster (13.0 vs 15.6 ms).
-#   Baseline 17 calls its helper with fixed bounds (0, n); the compiler specializes
-#   the inlined copy and it gets slower (S1+S2 alone: 10.7 ms vs 9.2 ms when the
-#   bounds are runtime values). More compile-time knowledge is not always faster.
+#   The cause was in 17 (constant start row -> scalar path); see Baseline 17b.
 # ---------------------------------------------------------
 L3_BYTES = 32 * 1024 * 1024     # one CCD's L3, the most one core can use
 PANEL_WIDTH = 512               # default for N=4096 (4096 x 512 x 8 B = 16.8 MB)
@@ -1398,14 +1430,14 @@ def measure_bandwidth(reps=10):
 
 # Passes over A (each pass = 8*N^2 bytes) used for the effective GB/s column.
 # - Unfused: stage 1 read + stage 1 write + stage 2 read + stage 4 read = 4.
-# - Fused (11, 12, 16, 17): stage 2 reuses A while it is in a register = 3.
+# - Fused (11, 12, 16, 17, 17b): stage 2 reuses A while it is in a register = 3.
 # - BLAS (18): dgemm read + write, then 2 dgemv reads = 4 (the default below).
 # - Column panels (19): read + write from DRAM, pass 2 from L3 = 2
 #   (the ideal; it holds only while the panel stays in L3).
 def gemver_passes_over_A(name):
     if name.startswith("19_"):
         return 2
-    fused = ("11_", "12_", "16_", "17_")
+    fused = ("11_", "12_", "16_", "17_", "17b_")
     return 3 if name.startswith(fused) else 4
 
 
@@ -1500,6 +1532,7 @@ BLAS_MT_ROWS = (
     "3_fastmath_ij_ji_ij",
     "11_fused_fastmath",
     "17_fused_unroll_jam",
+    "17b_unroll_jam_runtime_start",
     "17_fused_unroll_jam_par",
     "18_blas",
     "19_fused_panel_mk",
@@ -1544,7 +1577,7 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False, pw=None):
         """
         Run fn on fresh copies of A, x, and w (GEMVER updates them in place)
         and return the elapsed kernel time along with the result arrays.
-        extra: arguments after z (Baseline 19's panel width).
+        extra: arguments after z (17b's start row, Baseline 19's panel width).
         """
         A = A_initial.copy()
         x = x_initial.copy()
@@ -1609,9 +1642,10 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False, pw=None):
         ("15_tiled_microkernel", gemver_tiled_microkernel_15),
         ("16_no_hoist", gemver_no_hoist_16),
         ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
+        # third element: extra arguments after z (17b: start row 0, 19: panel width)
+        ("17b_unroll_jam_runtime_start", gemver_fused_unroll_jam_17b, (0,)),
         ("17_fused_unroll_jam_par", gemver_fused_unroll_jam_parallel_17),
         ("18_blas", gemver_blas_18),
-        # third element: extra arguments after z (the panel width)
         ("19_fused_panel", gemver_fused_panel_19, (pw,)),
         ("19_fused_panel_mk", gemver_fused_panel_mk_19, (pw,)),
         ("19_fused_panel_par", gemver_fused_panel_par_19, (pw,)),
@@ -1890,15 +1924,120 @@ def report_asm(vector_size):
 
 
 # ---------------------------------------------------------
+# Result Rows, Markdown Table and CSV
+# ---------------------------------------------------------
+# - One row per baseline with every column. The terminal table, the Markdown
+#   table ("md" mode) and the CSV are all printed from the same rows.
+# - Markdown: same layout as doc/benchmarks/matmul.md, so the doc table can be
+#   copied straight from the benchmark output.
+# - CSV: always written to results/gemver_results_N<N>.csv (slides, charts).
+RESULT_COLUMNS = ("Baseline Implementation", "GFLOP/s", "Time (ms)", "Abs Speedup",
+                  "Rel Speedup", "Passes over A", "GB/s", "% of peak", "Correct")
+CSV_COLUMNS = ("n", "baseline", "gflops", "time_s", "abs_speedup", "rel_speedup",
+               "passes_over_A", "gbps", "pct_of_peak", "correct")
+
+def result_rows(benchmark_data, n, bw_peak):
+    a_bytes = 8.0 * n * n
+    ref_elapsed = benchmark_data[0][2]      # Abs Speedup: vs the first row (pure Python)
+    rows = []
+    prev_elapsed = None
+    for name, gflops, elapsed, is_correct in benchmark_data:
+        passes = gemver_passes_over_A(name)
+        gbps = passes * a_bytes / elapsed / 1e9
+        rows.append({
+            "name": name,
+            "gflops": gflops,
+            "time_s": elapsed,
+            "abs_speedup": ref_elapsed / elapsed,
+            "rel_speedup": prev_elapsed / elapsed if prev_elapsed is not None else 1.0,
+            "passes": passes,
+            "gbps": gbps,
+            "pct_peak": 100 * gbps / bw_peak,
+            "correct": "PASS" if is_correct else "FAIL",
+        })
+        prev_elapsed = elapsed
+    return rows
+
+
+def print_box_table(rows):
+    header = (
+        f"| {'Baseline Implementation':<28} "
+        f"| {'GFLOP/s':>10} "
+        f"| {'Time (s)':>12} "
+        f"| {'Abs Speedup':>12} "
+        f"| {'Rel Speedup':>12} "
+        f"| {'Passes':>6} "
+        f"| {'GB/s':>7} "
+        f"| {'% of peak':>11} "
+        f"| {'Correct':<8} |"
+    )
+    divider = "-" * len(header)
+    print(divider)
+    print(header)
+    print(divider)
+    for r in rows:
+        print(
+            f"| {r['name']:<28} "
+            f"| {r['gflops']:10.4f} "
+            f"| {r['time_s']:12.6f} "
+            f"| {r['abs_speedup']:11.2f}x "
+            f"| {r['rel_speedup']:11.2f}x "
+            f"| {r['passes']:>6} "
+            f"| {r['gbps']:7.1f} "
+            f"| {r['pct_peak']:10.0f}% "
+            f"| {r['correct']:<8} |"
+        )
+    print(divider)
+
+
+def markdown_table(rows):
+    lines = [
+        "| " + " | ".join(RESULT_COLUMNS) + " |",
+        "| " + " | ".join(":---" for _ in RESULT_COLUMNS) + " |",
+    ]
+    for r in rows:
+        lines.append(
+            f"| {r['name']:<28} "
+            f"| {r['gflops']:10.3f} "
+            f"| {r['time_s'] * 1e3:10.3f} "
+            f"| {r['abs_speedup']:10.2f}x "
+            f"| {r['rel_speedup']:10.2f}x "
+            f"| {r['passes']:>13} "
+            f"| {r['gbps']:7.1f} "
+            f"| {r['pct_peak']:8.0f}% "
+            f"| {r['correct']:<7} |"
+        )
+    return "\n".join(lines)
+
+
+def write_results_csv(rows, n, path):
+    import csv
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    with open(path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(CSV_COLUMNS)
+        for r in rows:
+            writer.writerow([
+                n, r["name"], f"{r['gflops']:.4f}", f"{r['time_s']:.9f}",
+                f"{r['abs_speedup']:.3f}", f"{r['rel_speedup']:.3f}", r["passes"],
+                f"{r['gbps']:.2f}", f"{r['pct_peak']:.1f}", r["correct"],
+            ])
+    print(f"CSV written to {path}")
+
+
+# ---------------------------------------------------------
 # Formatting and Output Execution
 # ---------------------------------------------------------
 # Command line: python gemver_numba_bench.py [N] [mode words] [image.png] [--pw W]
 # - N: matrix size (default 512).
-# - Mode words (any order): threads, asm, blas_mt.
+# - Mode words (any order): threads, asm, blas_mt, md.
+#     - md: print the results as a Markdown table (matmul.md format)
+#       and save it as results/gemver_results_N<N>.md.
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
 # - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
-MODES = ("threads", "asm", "blas_mt")
+MODES = ("threads", "asm", "blas_mt", "md")
+RESULTS_DIR = "results"
 
 def parse_args(argv):
     n = DEFAULT_N
@@ -1974,49 +2113,27 @@ if __name__ == "__main__":
         print("A is served from cache at this size, so '% of peak' can exceed 100%.")
     print()
 
-    py_elapsed = benchmark_data[0][2]  # Reference execution time for pure Python naive
     if BLAS_MT:
         print(f"(blas_mt: no Python row, so Abs Speedup is relative to {benchmark_data[0][0]}.)\n")
 
-    # Table Header Formatting
-    header = (
-        f"| {'Baseline Implementation':<28} "
-        f"| {'GFLOP/s':>10} "
-        f"| {'Time (s)':>12} "
-        f"| {'Abs Speedup':>12} "
-        f"| {'Rel Speedup':>12} "
-        f"| {'GB/s':>7} "
-        f"| {'% of peak':>11} "
-        f"| {'Correct':<8} |"
-    )
+    rows = result_rows(benchmark_data, N_input, bw_peak)
 
-    divider = "-" * len(header)
+    # File names: results/gemver_results_N<N>[_blas_mt][_pw<W>].csv / .md
+    stem = os.path.join(RESULTS_DIR, f"gemver_results_N{N_input}"
+                        f"{'_blas_mt' if BLAS_MT else ''}"
+                        f"{f'_pw{pw}' if pw_input is not None else ''}")
 
-    print(divider)
-    print(header)
-    print(divider)
+    if "md" in modes:
+        table = markdown_table(rows)
+        print(table)
+        os.makedirs(RESULTS_DIR, exist_ok=True)
+        with open(stem + ".md", "w", encoding="utf-8") as fh:
+            fh.write(table + "\n")
+        print(f"\nMarkdown table written to {stem}.md")
+    else:
+        print_box_table(rows)
 
-    prev_elapsed = None
-
-    for name, gflops, elapsed, is_correct in benchmark_data:
-        abs_speedup = py_elapsed / elapsed
-        rel_speedup = (prev_elapsed / elapsed) if prev_elapsed is not None else 1.0
-        status = "PASS" if is_correct else "FAIL"
-        gbps = gemver_passes_over_A(name) * a_bytes / elapsed / 1e9
-
-        print(
-            f"| {name:<28} "
-            f"| {gflops:10.4f} "
-            f"| {elapsed:12.6f} "
-            f"| {abs_speedup:11.2f}x "
-            f"| {rel_speedup:11.2f}x "
-            f"| {gbps:7.1f} "
-            f"| {100 * gbps / bw_peak:10.0f}% "
-            f"| {status:<8} |"
-        )
-        prev_elapsed = elapsed
-
-    print(divider)
+    write_results_csv(rows, N_input, stem + ".csv")
 
     # Plotting Output
     names = [row[0] for row in benchmark_data]
