@@ -220,6 +220,10 @@ __marimo__/
 # Local notes for Claude Code (not pushed)
 CLAUDE.md
 .claude/
+*hand-off.md
+
+# CSV/PNG output of the benchmark modes (md, search, breakdown, scale)
+results/
 
 # Assembly dumps from "python benchmarks/gemver_numba_bench.py <N> asm"
 asm/

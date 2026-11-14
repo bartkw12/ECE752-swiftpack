@@ -21,18 +21,32 @@
 # - allclose uses rtol=atol=1e-5 because optimized reductions may change rounding order.
 
 import os
+import sys
+
+# "blas_mt" on the command line: let BLAS use all its threads (row 18_blas_mt)
+# - Must be decided here: OpenBLAS reads its thread count once, when NumPy/SciPy load.
+BLAS_MT = "blas_mt" in sys.argv[1:]
 
 # Set single-threaded execution for external BLAS libraries to ensure reproducible benchmarks.
 # These must be set before NumPy is imported to take effect.
-os.environ["OPENBLAS_NUM_THREADS"] = "1"
-os.environ["MKL_NUM_THREADS"] = "1"
-os.environ["OMP_NUM_THREADS"] = "1"
+if not BLAS_MT:
+    os.environ["OPENBLAS_NUM_THREADS"] = "1"
+    os.environ["MKL_NUM_THREADS"] = "1"
+    os.environ["OMP_NUM_THREADS"] = "1"
 
-import sys
 import time
+import matplotlib
+
+# Image path (*.png) on the command line: draw off-screen with Agg (no display needed,
+# as on the professor's run_bench.sh server). Must be set before pyplot is imported.
+if any(arg.lower().endswith(".png") for arg in sys.argv[1:]):
+    matplotlib.use("Agg")
+
 import matplotlib.pyplot as plt
 from numba import njit, prange, get_num_threads, set_num_threads, threading_layer
 import numpy as np
+import scipy
+from scipy.linalg import blas
 
 # Default benchmark configuration
 DEFAULT_N = 512
@@ -1076,6 +1090,43 @@ def gemver_fused_unroll_jam_parallel_17(alpha, beta, A, u1, v1, u2, v2, w, x, y,
 
 
 # ---------------------------------------------------------
+# Baseline 18: Optimized library baseline (direct BLAS, in place)
+# - The "np.dot of GEMVER": vendor BLAS for every stage (matmul compares to np.dot).
+# - GEMVER itself is not a routine in OpenBLAS or MKL (only in the 2001 BLAS
+#   Technical Forum standard), so it is built from dgemm + dgemv calls.
+# - S1 = one rank-2 dgemm: A += [u1 u2] [v1 v2]^T -> 1 read + 1 write of A.
+#     - Baseline 10 instead builds two N x N np.outer temporaries.
+# - S2, S4 = dgemv; S3 = vector add. No temporaries the size of A.
+# - Row-major A is passed as A.T, which BLAS sees as a column-major matrix
+#   (same memory, no copy). A += U V^T then becomes A.T += V U^T.
+# - Still 4 passes over A: separate library calls cannot fuse stages.
+# - Expect: about Baseline 3 speed (also 4 passes); slower than fused 11/17.
+# - If SciPy ever copied instead of writing in place, A/x/w would stay
+#   unchanged and the correctness check would show FAIL.
+# - "blas_mt" mode runs it again with all BLAS threads (row 18_blas_mt).
+# ---------------------------------------------------------
+def gemver_blas_18(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+    n = A.shape[0]
+    At = A.T                                  # column-major view of A, no copy
+
+    U = np.empty((n, 2), order="F")           # [u1 u2], column-major like BLAS wants
+    U[:, 0] = u1
+    U[:, 1] = u2
+    V = np.empty((n, 2), order="F")           # [v1 v2]
+    V[:, 0] = v1
+    V[:, 1] = v2
+
+    # S1: At = 1.0 * V U^T + 1.0 * At   (one rank-2 update, written into A)
+    blas.dgemm(1.0, V, U, beta=1.0, c=At, trans_b=1, overwrite_c=1)
+    # S2: x = beta * At y + 1.0 * x     (At y = A^T y)
+    blas.dgemv(beta, At, y, beta=1.0, y=x, overwrite_y=1)
+    # S3
+    x += z
+    # S4: w = alpha * At^T x + 1.0 * w  (trans=1: At^T = A)
+    blas.dgemv(alpha, At, x, beta=1.0, y=w, trans=1, overwrite_y=1)
+
+
+# ---------------------------------------------------------
 # Memory Bandwidth Reference (not a GEMVER baseline)
 # - Measures how fast this machine can stream data from DRAM.
 # - Kernel a = a + s*b: reads a, reads b, writes a (3 x 8 bytes per element).
@@ -1132,6 +1183,7 @@ def measure_bandwidth(reps=10):
 # Passes over A (each pass = 8*N^2 bytes) used for the effective GB/s column.
 # - Unfused: stage 1 read + stage 1 write + stage 2 read + stage 4 read = 4.
 # - Fused (11, 12, 16, 17): stage 2 reuses A while it is in a register = 3.
+# - BLAS (18): dgemm read + write, then 2 dgemv reads = 4 (the default below).
 def gemver_passes_over_A(name):
     fused = ("11_", "12_", "16_", "17_")
     return 3 if name.startswith(fused) else 4
@@ -1142,6 +1194,35 @@ def gemver_passes_over_A(name):
 # - Unfused baselines read/write A 4 times, fused ones 3 times.
 def roofline_bytes(name, n):
     return gemver_passes_over_A(name) * 8.0 * n * n
+
+
+# Which BLAS is really called (professor: "make sure the call is the right BLAS")
+# - NumPy (Baseline 10) and SciPy (Baseline 18) can each bundle their own BLAS build.
+# - Library name/version from show_config(); thread count from threadpoolctl when it
+#   is installed, otherwise from the environment variables set at the top of this file.
+def blas_info():
+    builds = {}
+    for label, lib in (("numpy", np), ("scipy", scipy)):
+        try:
+            cfg = lib.show_config(mode="dicts")["Build Dependencies"]["blas"]
+            builds[label] = f"{cfg.get('name', '?')} {cfg.get('version', '')}".strip()
+        except Exception:
+            builds[label] = "unknown"
+
+    try:
+        from threadpoolctl import threadpool_info
+        pools = [p for p in threadpool_info() if p.get("user_api") == "blas"]
+        threads = ", ".join(f"{p.get('internal_api')} {p.get('version')}: {p.get('num_threads')} thr"
+                            for p in pools) or "no BLAS pool found"
+        threads = "threadpoolctl -> " + threads
+    except ImportError:
+        if BLAS_MT:
+            threads = "library default (blas_mt: thread pins not set)"
+        else:
+            threads = f"OPENBLAS_NUM_THREADS={os.environ.get('OPENBLAS_NUM_THREADS')}"
+
+    return (f"BLAS: NumPy uses {builds['numpy']}; SciPy (Baseline 18) uses {builds['scipy']}\n"
+            f"BLAS threads: {threads}")
 
 
 # ---------------------------------------------------------
@@ -1194,7 +1275,16 @@ def gemver_flop_count(n):
 # ---------------------------------------------------------
 # Execution and Benchmarking Routine
 # ---------------------------------------------------------
-def run_benchmark(vector_size=DEFAULT_N):
+# Rows kept in "blas_mt" mode (multi-threaded BLAS vs the best Numba versions)
+BLAS_MT_ROWS = (
+    "3_fastmath_ij_ji_ij",
+    "11_fused_fastmath",
+    "17_fused_unroll_jam",
+    "17_fused_unroll_jam_par",
+    "18_blas",
+)
+
+def run_benchmark(vector_size=DEFAULT_N, blas_mt=False):
     (
         A_initial,
         u1,
@@ -1267,8 +1357,9 @@ def run_benchmark(vector_size=DEFAULT_N):
 
     # 0. Pure Python (GEMVER is O(N^2), so no size cap is needed for
     # moderate N, but very large N will still take a long time)
-    gflops, elapsed, is_correct = measure(gemver_python_0, warmup=False, min_reps=1, min_time=0.0)
-    results.append(("0_python_naive", gflops, elapsed, is_correct))
+    if not blas_mt:
+        gflops, elapsed, is_correct = measure(gemver_python_0, warmup=False, min_reps=1, min_time=0.0)
+        results.append(("0_python_naive", gflops, elapsed, is_correct))
 
     # Baseline functions list
     functions = [
@@ -1292,7 +1383,13 @@ def run_benchmark(vector_size=DEFAULT_N):
         ("16_no_hoist", gemver_no_hoist_16),
         ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
         ("17_fused_unroll_jam_par", gemver_fused_unroll_jam_parallel_17),
+        ("18_blas", gemver_blas_18),
     ]
+
+    # blas_mt mode: small table, and the BLAS row is renamed to show its threads
+    if blas_mt:
+        functions = [("18_blas_mt" if name == "18_blas" else name, fn)
+                     for name, fn in functions if name in BLAS_MT_ROWS]
 
     for name, fn in functions:
         gflops, elapsed, is_correct = measure(fn)
@@ -1548,36 +1645,54 @@ def report_asm(vector_size):
 # ---------------------------------------------------------
 # Formatting and Output Execution
 # ---------------------------------------------------------
+# Command line: python gemver_numba_bench.py [N] [mode words] [image.png]
+# - N: matrix size (default 512).
+# - Mode words (any order): threads, asm, blas_mt.
+# - image.png: save the plot there instead of opening a window
+#   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
+MODES = ("threads", "asm", "blas_mt")
+
+def parse_args(argv):
+    n = DEFAULT_N
+    modes = set()
+    image_path = None
+    for arg in argv:
+        if arg.lower().endswith(".png"):
+            image_path = arg
+        elif arg in MODES:
+            modes.add(arg)
+        else:
+            try:
+                value = int(arg)
+            except ValueError:
+                print(f"Ignoring unknown argument '{arg}'. "
+                      f"Expected N, a .png path, or one of: {', '.join(MODES)}.")
+                continue
+            if value > 0:
+                n = value
+            else:
+                print(f"Invalid vector size. Using the default N={DEFAULT_N}.")
+    return n, modes, image_path
+
+
 if __name__ == "__main__":
-    if len(sys.argv) > 1:
-        try:
-            N_input = int(sys.argv[1])
+    N_input, modes, image_path = parse_args(sys.argv[1:])
 
-            if N_input <= 0:
-                raise ValueError
-
-        except ValueError:
-            print(
-                "Invalid vector size. Using the default "
-                f"N={DEFAULT_N}."
-            )
-            N_input = DEFAULT_N
-    else:
-        N_input = DEFAULT_N
-
-    # Optional second argument selects a sweep instead of the baseline table.
-    if len(sys.argv) > 2 and sys.argv[2] == "threads":
+    # A mode word selects a sweep instead of the baseline table.
+    if "threads" in modes:
         report_thread_sweep(N_input)
         sys.exit(0)
-    if len(sys.argv) > 2 and sys.argv[2] == "asm":
+    if "asm" in modes:
         report_asm(N_input)
         sys.exit(0)
 
-    print(f"\nRunning GEMVER Benchmarks for N={N_input}...")
+    print(f"\nRunning GEMVER Benchmarks for N={N_input}"
+          f"{' (blas_mt: multi-threaded BLAS, short table)' if BLAS_MT else ''}...")
     print(f"CPU: {CPU_NAME}")
-    print(f"Numba threads: {get_num_threads()}\n")
+    print(f"Numba threads: {get_num_threads()}")
+    print(blas_info() + "\n")
 
-    benchmark_data = run_benchmark(N_input)
+    benchmark_data = run_benchmark(N_input, blas_mt=BLAS_MT)
 
     # The threading layer is only chosen once a parallel function has run.
     print(f"Numba threading layer: {threading_layer()}\n")
@@ -1599,6 +1714,8 @@ if __name__ == "__main__":
     print()
 
     py_elapsed = benchmark_data[0][2]  # Reference execution time for pure Python naive
+    if BLAS_MT:
+        print(f"(blas_mt: no Python row, so Abs Speedup is relative to {benchmark_data[0][0]}.)\n")
 
     # Table Header Formatting
     header = (
@@ -1665,11 +1782,12 @@ if __name__ == "__main__":
     plt.grid(True, which="both", ls="--", alpha=0.5)
     plt.tight_layout()
 
-    # Optional image path as the second argument (same as upstream matmul / run_bench.sh)
-    # - With a path: save the PNG, no window (works on a server with no display).
+    # Optional image path (same as upstream matmul / run_bench.sh)
+    # - With a .png path: save the PNG, no window (works on a server with no display).
     # - Without: show the window, as in the live walkthrough.
-    if len(sys.argv) > 2:
-        plt.savefig(sys.argv[2], dpi=300)
-        print(f"Plot saved to {sys.argv[2]}")
+    if image_path:
+        os.makedirs(os.path.dirname(image_path) or ".", exist_ok=True)
+        plt.savefig(image_path, dpi=300)
+        print(f"Plot saved to {image_path}")
     else:
         plt.show()
