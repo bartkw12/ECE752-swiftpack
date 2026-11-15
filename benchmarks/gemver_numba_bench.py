@@ -2184,6 +2184,357 @@ def plot_breakdown(results, n, rounds, path, show):
 
 
 # ---------------------------------------------------------
+# Scalability over N
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py scale        (add "md" for Markdown tables)
+#            python gemver_numba_bench.py 2048 scale   (only sizes up to 2048: quicker)
+# - Professor (to classmates): "test scalability across data sizes",
+#   "how scalable is the optimization".
+# - Kernels: 1, 2 (best order), 3, 10, 11, 12, 17, 17b, 18, 19_mk, 19_par.
+#   Baseline 0 (pure Python) only up to N=512 (about 22 s per call at N=4096).
+# - Timing is "warm": the same arrays are passed again and again, so A stays in
+#   the cache whenever it fits (the matmul benchmark times its kernels this way).
+#     - The first call runs on fresh copies and is checked against NumPy.
+#     - The timed calls repeat the same work on the updated arrays; median of >= 9.
+# - Why not a fresh copy before each call (as in the main table):
+#     - For A between 2 and 32 MB, how much of A the copy leaves in the cache
+#       depends on Windows' memory state, so the time jumps between runs
+#       (17b at N=512: 15 or 23-28 GFLOP/s; warm: 44 on every run).
+#     - Once A is larger than the L3, both ways give the same time.
+# - 19 uses the default panel width at each N (L3/2 rule). Up to N=1024 that is
+#   one panel (PW = N), so S4 is not fused there (3 passes, like 17).
+# - Where A lives (A = 8 N^2 bytes; one core sees 512 KB of L2 and 32 MB of L3):
+#     - L2: N <= 256      - L3: N <= 2048      - DRAM: N > 2048
+#     - Threads on both CCDs see 64 MB of L3 (N <= 2896).
+# - DRAM roofs: if every pass over A comes from DRAM at the measured bandwidth,
+#   GFLOP/s <= 10 N^2 / (passes x 8 N^2 / BW) = 1.25 x BW / passes (same for every N).
+# - Expect: fastest while A is in cache, a drop once A leaves the L3 (N > 2048),
+#   then flat lines under the DRAM roofs. Fused versions (3 passes) keep their
+#   lead over the unfused ones (4 passes) after the drop.
+# - Observed (5900X, roofs at 37.7 GB/s):
+#     - Serial, A in cache (N <= 1536): 17b and 19_mk 37-46 GFLOP/s, 3 about 30.
+#     - N=2048 (A = 33.6 MB, just over the L3): serial speed halves (17b 45 -> 22).
+#     - DRAM: 17b 12-14.5 GFLOP/s (86% of the 3-pass roof at N=4096);
+#       3 about 9 (77% of the 4-pass roof).
+#     - Parallel 12 / 19_par: 74-159 GFLOP/s while A fits in both CCDs' L3
+#       (N <= 2048), 11-14 in DRAM. Threads pay off in cache, hardly in DRAM.
+#     - Fusion keeps its lead after the drop: 17b 1.35-1.6x over 3 for N >= 3072
+#       (11: 1.15-1.3x). BLAS (18) stays at about 0.7x of 3.
+#     - 19_mk falls behind as N grows: PW shrinks to 256 at N >= 6144 (short rows).
+#     - 17 vs 17b: 2.6x slower in cache (N=1024), only 1.1x in DRAM.
+# - Output: tables (GFLOP/s, speedup vs 3), results/scale.csv, results/scale.png.
+# ---------------------------------------------------------
+SCALE_SIZES = (256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
+SCALE_PYTHON_MAX_N = 512
+SCALE_ROWS = (
+    ("0_python_naive", gemver_python_0),
+    ("1_numba_naive", gemver_numba_1),
+    ("2_order_ij_ji_ij", gemver_2_ij_ji_ij),
+    ("3_fastmath_ij_ji_ij", gemver_opt_flags_3),
+    ("10_numpy", gemver_numpy_10),
+    ("11_fused_fastmath", gemver_fused_11),
+    ("12_fused_parallel", gemver_fused_parallel_12),
+    ("17_fused_unroll_jam", gemver_fused_unroll_jam_17),
+    ("17b_unroll_jam_runtime_start", gemver_fused_unroll_jam_17b),
+    ("18_blas", gemver_blas_18),
+    ("19_fused_panel_mk", gemver_fused_panel_mk_19),
+    ("19_fused_panel_par", gemver_fused_panel_par_19),
+)
+L2_BYTES = 512 * 1024           # one core's L2
+
+# Chart: one fixed color + marker per kernel (8 slots, in order, never cycled).
+# - 1 and 2 are gray context lines; 0 (two points) and 17 (= 17b before the fix)
+#   are only in the tables and the CSV.
+SCALE_STYLE = {
+    "3_fastmath_ij_ji_ij": ("#2a78d6", "o", "3: unfused + fastmath"),
+    "10_numpy": ("#eb6834", "s", "10: NumPy"),
+    "11_fused_fastmath": ("#1baf7a", "^", "11: S1+S2 fused"),
+    "12_fused_parallel": ("#eda100", "D", "12: fused + parallel"),
+    "17b_unroll_jam_runtime_start": ("#e87ba4", "v", "17b: fused + unroll-and-jam"),
+    "18_blas": ("#008300", "P", "18: BLAS (dgemm + 2 dgemv)"),
+    "19_fused_panel_mk": ("#6250d6", "X", "19_mk: column panels + micro-kernel"),
+    "19_fused_panel_par": ("#e34948", "h", "19_par: column panels, parallel"),
+}
+SCALE_CONTEXT = {
+    "1_numba_naive": (":", "1: naive Numba"),
+    "2_order_ij_ji_ij": ("--", "2: best loop order"),
+}
+
+
+def cache_level(n):
+    # Smallest cache level that holds A (one core's view)
+    a_bytes = 8.0 * n * n
+    return "L2" if a_bytes <= L2_BYTES else "L3" if a_bytes <= L3_BYTES else "DRAM"
+
+
+def scale_roof(passes, bw):
+    # GFLOP/s when every pass over A runs at bandwidth bw (GB/s): 10 N^2 FLOPs per passes x 8 N^2 bytes
+    return 10.0 / (8.0 * passes) * bw
+
+
+def free_ram_bytes():
+    # Free physical memory in bytes (no extra package needed); None if unknown.
+    try:
+        if sys.platform == "win32":
+            import ctypes
+
+            class MemoryStatus(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong), ("dwMemoryLoad", ctypes.c_ulong)] + [
+                    (f, ctypes.c_ulonglong) for f in ("total", "avail", "total_page", "avail_page",
+                                                      "total_virtual", "avail_virtual", "avail_ext")]
+
+            status = MemoryStatus()
+            status.dwLength = ctypes.sizeof(status)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+            return status.avail
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemAvailable:"):
+                    return int(line.split()[1]) * 1024
+    except (OSError, AttributeError, ValueError):
+        pass
+    return None
+
+
+def run_scale(sizes):
+    # Per N: NumPy check on fresh copies, then warm timing. Returns (rows, sizes that ran).
+    rows, ran = [], []
+    for n in sizes:
+        # - RAM check: A, the reference A, the working copy and NumPy's 3 temporaries
+        #   (Baseline 10) are each 8 N^2 bytes; 7 of them leaves some room.
+        need, free = 7 * 8.0 * n * n, free_ram_bytes()
+        if free is not None and need > free:
+            print(f"N={n:5d}: skipped, needs about {need / 1e9:.1f} GB of RAM ({free / 1e9:.1f} GB free)")
+            continue
+        A0, u1, v1, u2, v2, w0, x0, y, z = initialize_gemver(n)
+        A_exp, x_exp, w_exp = gemver_numpy_reference(ALPHA, BETA, A0, u1, v1, u2, v2, w0, x0, y, z)
+        flops = gemver_flop_count(n)
+        pw = default_panel_width(n)
+        start = time.perf_counter()
+        count = 0
+        for name, fn in SCALE_ROWS:
+            python = name == "0_python_naive"
+            if python and n > SCALE_PYTHON_MAX_N:
+                continue
+            # arguments after z: 17b's start row, Baseline 19's panel width
+            extra = (0,) if name.startswith("17b_") else (pw,) if name.startswith("19_") else ()
+            A, x, w = A0.copy(), x0.copy(), w0.copy()
+            fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)     # compiles; result checked
+            correct = (np.allclose(A, A_exp, rtol=1e-5, atol=1e-5)
+                       and np.allclose(x, x_exp, rtol=1e-5, atol=1e-5)
+                       and np.allclose(w, w_exp, rtol=1e-5, atol=1e-5))
+            # warm timing: same arrays again (same work, A in cache when it fits)
+            times = []
+            while len(times) < (1 if python else 9) or (not python and sum(times) < 0.3 and len(times) < 200):
+                t0 = time.perf_counter()
+                fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
+                times.append(time.perf_counter() - t0)
+            elapsed = float(np.median(times))
+            rows.append({"n": n, "name": name, "gflops": flops / elapsed / 1e9, "time_s": elapsed,
+                         "passes": gemver_passes_over_A(name), "pw": pw if name.startswith("19_") else "",
+                         "correct": correct})
+            count += 1
+        del A, x, w
+        note = "" if n <= SCALE_PYTHON_MAX_N else "  (Baseline 0 skipped: pure Python, too slow)"
+        print(f"N={n:5d}  A = {8.0 * n * n / 1e6:6.1f} MB ({cache_level(n):>4})  PW = {pw:4d}  "
+              f"{count:2d} kernels in {time.perf_counter() - start:5.1f} s{note}", flush=True)
+        ran.append(n)
+    return rows, ran
+
+
+def report_scale(sizes, image_path=None, markdown=False, stem=None):
+    # stem: output path without extension (default results/scale)
+    stem = stem or os.path.join(RESULTS_DIR, "scale")
+    print(f"\nRunning GEMVER Scalability Sweep, N = {', '.join(str(n) for n in sizes)}...")
+    print(f"CPU: {CPU_NAME}")
+    print(f"Numba threads: {get_num_threads()} (used by 12 and 19_par)")
+    print("Warm timing: the same arrays are called repeatedly (A stays in cache when it fits); "
+          "the first call is checked against NumPy.")
+    print(f"Baseline 0 (pure Python) only up to N={SCALE_PYTHON_MAX_N}; "
+          f"Baseline 19 uses the default panel width at each N.\n")
+
+    start = time.perf_counter()
+    rows, ran = run_scale(sizes)
+    if not ran:
+        print("Nothing was run.")
+        return
+    print(f"\nSweep took {time.perf_counter() - start:.0f} s. Numba threading layer: {threading_layer()}")
+
+    bw_serial, bw_by_threads = measure_bandwidth()
+    bw_peak = max(bw_serial, max(bw_by_threads.values()))
+    print(f"Measured memory bandwidth (peak of the a = a + s*b runs): {bw_peak:.1f} GB/s")
+    print("DRAM roofs (every pass over A from DRAM): " + ", ".join(
+        f"{p} passes {scale_roof(p, bw_peak):.1f}" for p in (4, 3, 2)) + " GFLOP/s\n")
+
+    # - Per row: effective GB/s, % of peak, speedup over Baseline 3 at the same N
+    base = {r["n"]: r["time_s"] for r in rows if r["name"] == "3_fastmath_ij_ji_ij"}
+    for r in rows:
+        r["gbps"] = r["passes"] * 8.0 * r["n"] ** 2 / r["time_s"] / 1e9
+        r["pct_peak"] = 100 * r["gbps"] / bw_peak
+        r["vs3"] = base[r["n"]] / r["time_s"] if r["n"] in base else float("nan")
+    by_name = {}
+    for r in rows:
+        by_name.setdefault(r["name"], {})[r["n"]] = r
+    names = [name for name, _ in SCALE_ROWS if name in by_name]
+
+    def table(cell, markdown_style):
+        # rows = kernels, columns = N; "-" where a kernel was not run
+        head = ["Baseline"] + [str(n) for n in ran] + ["Correct"]
+        info = [["A size (MB)"] + [f"{8.0 * n * n / 1e6:.1f}" for n in ran] + [""],
+                ["A fits in"] + [cache_level(n) for n in ran] + [""]]
+        body = []
+        for name in names:
+            cells = [cell(by_name[name][n]) if n in by_name[name] else "-" for n in ran]
+            bad = [str(n) for n, r in by_name[name].items() if not r["correct"]]
+            body.append([name] + cells + ["PASS" if not bad else "FAIL at " + ",".join(bad)])
+        if markdown_style:
+            lines = ["| " + " | ".join(head) + " |", "| " + " | ".join(":---" for _ in head) + " |"]
+            lines += ["| " + " | ".join(row) + " |" for row in info + body]
+            return "\n".join(lines)
+        widths = [max([28] + [len(row[0]) for row in body])] + [7] * len(ran) + [8]
+        fmt = lambda row: "| " + " | ".join(
+            (c.ljust(w) if k in (0, len(row) - 1) else c.rjust(w)) for k, (c, w) in enumerate(zip(row, widths))) + " |"
+        divider = "-" * len(fmt(head))
+        return "\n".join([divider, fmt(head)] + [fmt(row) for row in info] + [divider]
+                         + [fmt(row) for row in body] + [divider])
+
+    gflops_table = table(lambda r: f"{r['gflops']:.2f}" if r["gflops"] >= 0.1 else f"{r['gflops']:.3f}",
+                         markdown)
+    speedup_table = table(lambda r: f"{r['vs3']:.2f}x", markdown)
+    print("GFLOP/s (higher is better)")
+    print(gflops_table)
+    print("\nSpeedup over Baseline 3 at the same N (does the lead hold as N grows?)")
+    print(speedup_table)
+
+    os.makedirs(os.path.dirname(stem) or ".", exist_ok=True)
+    if markdown:
+        with open(stem + ".md", "w", encoding="utf-8") as fh:
+            fh.write("GFLOP/s (higher is better)\n\n" + gflops_table + "\n\n"
+                     "Speedup over Baseline 3 at the same N\n\n" + speedup_table + "\n")
+        print(f"\nMarkdown tables written to {stem}.md")
+
+    import csv
+    with open(stem + ".csv", "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("n", "a_mb", "a_fits_in", "baseline", "gflops", "time_s", "passes_over_A",
+                         "gbps", "pct_of_peak", "speedup_vs_3", "panel_width", "correct"))
+        for r in rows:
+            writer.writerow((r["n"], f"{8.0 * r['n'] ** 2 / 1e6:.2f}", cache_level(r["n"]), r["name"],
+                             f"{r['gflops']:.4f}", f"{r['time_s']:.9f}", r["passes"], f"{r['gbps']:.2f}",
+                             f"{r['pct_peak']:.1f}", f"{r['vs3']:.3f}", r["pw"],
+                             "PASS" if r["correct"] else "FAIL"))
+    print(f"CSV written to {stem}.csv")
+
+    plot_scale(by_name, ran, bw_peak, image_path or stem + ".png", show=image_path is None)
+
+
+def plot_scale(by_name, sizes, bw_peak, path, show):
+    # Line chart: GFLOP/s vs N (log x), cache levels shaded, DRAM roofs dashed.
+    from matplotlib.ticker import NullLocator
+    from matplotlib.transforms import blended_transform_factory
+    surface, ink, ink2, muted = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
+    grid, axis_color = "#e1e0d9", "#c3c2b7"
+
+    fig, ax = plt.subplots(figsize=(12, 7), facecolor=surface)
+    fig.subplots_adjust(left=0.075, right=0.845, top=0.74, bottom=0.14)
+    ax.set_facecolor(surface)
+    ax.set_xscale("log", base=2)
+    lo, hi = min(sizes) / 1.6, max(sizes) * 1.25
+    ax.set_xlim(lo, hi)
+
+    # - Shaded bands: where A lives. Boundary = N at which A equals the cache size.
+    n_l2, n_l3 = (L2_BYTES / 8) ** 0.5, (L3_BYTES / 8) ** 0.5
+    bands = [(lo, n_l2, "#eeede8", "A in L2", "(0.5 MB)"),
+             (n_l2, n_l3, "#f5f4f0", "A in L3", "(32 MB)"),
+             (n_l3, hi, surface, "A in DRAM", "(beyond 32 MB)")]
+    renderer = fig.canvas.get_renderer()
+    for x0, x1, color, label, sub in bands:
+        x0, x1 = max(x0, lo), min(x1, hi)
+        if x1 <= x0:
+            continue
+        ax.axvspan(x0, x1, color=color, zorder=0, linewidth=0)
+        text = ax.text((x0 * x1) ** 0.5, 0.985, f"{label}\n{sub}", transform=blended_transform_factory(
+            ax.transData, ax.transAxes), ha="center", va="top", fontsize=9, color=ink2, linespacing=1.3)
+        left, right = ax.transData.transform((x0, 0))[0], ax.transData.transform((x1, 0))[0]
+        if text.get_window_extent(renderer).width + 8 > right - left:
+            text.remove()                          # band too narrow for its label
+    for boundary in (n_l2, n_l3):
+        if lo < boundary < hi:
+            ax.axvline(boundary, color=axis_color, linewidth=0.8, zorder=1)
+    # - Threads on both CCDs share 2 x 32 MB of L3: the parallel kernels drop later
+    n_l3_both = (2 * L3_BYTES / 8) ** 0.5
+    if lo < n_l3_both < hi:
+        ax.axvline(n_l3_both, color=axis_color, linewidth=0.8, linestyle=(0, (1, 2)), zorder=1)
+        ax.text(n_l3_both * 1.03, 0.84, "64 MB: L3 of both CCDs\n(limit for the parallel kernels)",
+                transform=blended_transform_factory(ax.transData, ax.transAxes),
+                ha="left", va="top", fontsize=8, color=muted, linespacing=1.3)
+
+    # - Context lines first (gray), then the colored kernels on top
+    for name, (style, label) in SCALE_CONTEXT.items():
+        if name in by_name:
+            ns = sorted(by_name[name])
+            ax.plot(ns, [by_name[name][n]["gflops"] for n in ns], color=muted, linestyle=style,
+                    linewidth=1.4, marker="o", markersize=3.5, label=label, zorder=2)
+    plotted = [by_name[name][n]["gflops"] for name in list(SCALE_STYLE) + list(SCALE_CONTEXT)
+               if name in by_name for n in by_name[name]]
+    for name, (color, marker, label) in SCALE_STYLE.items():
+        if name in by_name:
+            ns = sorted(by_name[name])
+            ax.plot(ns, [by_name[name][n]["gflops"] for n in ns], color=color, linewidth=1.8,
+                    marker=marker, markersize=8, markeredgecolor=surface, markeredgewidth=1.2,
+                    label=label, zorder=3)
+
+    # - DRAM roofs: only meaningful where A comes from DRAM; labels in the right margin
+    roof_x0 = max(n_l3, lo)
+    to_margin = blended_transform_factory(ax.transAxes, ax.transData)
+    for passes in (4, 3, 2):
+        g = scale_roof(passes, bw_peak)
+        plotted.append(g)
+        if roof_x0 < hi:
+            ax.hlines(g, roof_x0, hi, colors=ink2, linestyles=(0, (5, 3)), linewidth=1.1, zorder=2)
+            ax.text(1.012, g, f"{passes}-pass roof  {g:.1f}", transform=to_margin,
+                    ha="left", va="center", fontsize=8.5, color=ink2)
+
+    # - Log y: from about 1 (naive) to about 150 (parallel, in cache); equal gaps = equal ratios
+    ax.set_yscale("log")
+    ax.set_ylim(min(plotted) / 1.5, max(plotted) * 2.2)    # head room for the band labels
+    ticks = [t for t in (0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500) if min(plotted) / 1.5 <= t <= max(plotted) * 2.2]
+    ax.set_yticks(ticks)
+    ax.set_yticklabels([f"{t:g}" for t in ticks])
+    ax.yaxis.set_minor_locator(NullLocator())
+    ax.set_xticks(sizes)
+    ax.set_xticklabels([f"{n}\n{8.0 * n * n / 1e6:.1f} MB" if 8.0 * n * n < 10e6 else
+                        f"{n}\n{8.0 * n * n / 1e6:.0f} MB" for n in sizes], fontsize=9, color=ink2)
+    ax.xaxis.set_minor_locator(NullLocator())
+    ax.tick_params(axis="x", length=0, pad=6)
+    ax.tick_params(axis="y", colors=muted, length=0)
+    ax.yaxis.grid(True, color=grid, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(axis_color)
+    ax.set_xlabel("Matrix size N (second line: size of A)", color=ink2)
+    ax.set_ylabel("GFLOP/s (log scale, higher is better)", color=ink2)
+
+    handles, labels = ax.get_legend_handles_labels()
+    n_context = sum(1 for name in SCALE_CONTEXT if name in by_name)      # gray lines go last
+    order = list(range(n_context, len(labels))) + list(range(n_context))
+    ax.legend([handles[k] for k in order], [labels[k] for k in order], loc="lower left",
+              bbox_to_anchor=(0, 1.02), ncol=4, frameon=False, fontsize=9, labelcolor=ink2,
+              handlelength=2.6, columnspacing=1.6)
+    fig.text(0.075, 0.955, f"GEMVER throughput as the matrix grows (N={sizes[0]} to {sizes[-1]})",
+             fontsize=13, color=ink, ha="left")
+    fig.text(0.075, 0.918, f"Warm timing (A stays in cache when it fits), median of >= 9 calls. "
+             f"Dashed: DRAM roofs at {bw_peak:.1f} GB/s | CPU: {CPU_NAME}", fontsize=9, color=muted, ha="left")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=300, facecolor=surface)
+    print(f"Plot saved to {path}")
+    if show:
+        plt.show()
+
+
+# ---------------------------------------------------------
 # Assembly Check
 # ---------------------------------------------------------
 # Run with:  python gemver_numba_bench.py <N> asm
@@ -2331,18 +2682,20 @@ def write_results_csv(rows, n, path):
 # ---------------------------------------------------------
 # Command line: python gemver_numba_bench.py [N] [mode words] [image.png] [--pw W]
 # - N: matrix size (default 512).
-# - Mode words (any order): threads, asm, blas_mt, md, breakdown.
+# - Mode words (any order): threads, asm, blas_mt, md, breakdown, scale.
 #     - md: print the results as a Markdown table (matmul.md format)
 #       and save it as results/gemver_results_N<N>.md.
 #     - breakdown: time per stage instead of the baseline table.
+#     - scale: sweep N = 256 ... 8192 (an N given with it = largest size).
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
 # - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
-MODES = ("threads", "asm", "blas_mt", "md", "breakdown")
+MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale")
 RESULTS_DIR = "results"
 
 def parse_args(argv):
     n = DEFAULT_N
+    n_given = False         # scale mode: an N on the command line caps the sizes
     modes = set()
     image_path = None
     pw = None
@@ -2368,14 +2721,24 @@ def parse_args(argv):
                 continue
             if value > 0:
                 n = value
+                n_given = True
             else:
                 print(f"Invalid vector size. Using the default N={DEFAULT_N}.")
-    return n, modes, image_path, pw
+    return n, modes, image_path, pw, n_given
 
 
 if __name__ == "__main__":
-    N_input, modes, image_path, pw_input = parse_args(sys.argv[1:])
+    N_input, modes, image_path, pw_input, n_given = parse_args(sys.argv[1:])
     pw = pw_input if pw_input is not None else default_panel_width(N_input)
+
+    # scale: every size in SCALE_SIZES (or up to the N given); CSV/PNG in results/
+    if "scale" in modes:
+        sizes = [n for n in SCALE_SIZES if n <= N_input] if n_given else list(SCALE_SIZES)
+        if pw_input is not None:
+            print("scale: --pw ignored (Baseline 19 uses the default panel width at each N).")
+        report_scale(sizes or [N_input], image_path, markdown="md" in modes,
+                     stem=os.path.join(RESULTS_DIR, f"scale_to{N_input}" if n_given else "scale"))
+        sys.exit(0)
 
     # A mode word selects a sweep instead of the baseline table.
     if "threads" in modes:
