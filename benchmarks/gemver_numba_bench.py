@@ -1883,6 +1883,307 @@ def save_or_show(image_path):
 
 
 # ---------------------------------------------------------
+# Per-Stage Breakdown
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py <N> breakdown   (add "md" for a Markdown table)
+# - Professor: "what is the breakdown of each step, use it for justification".
+# - Times each stage separately: shows where the time goes and what each
+#   optimization removed. One bar per version:
+#     - 3 (unfused, fastmath):        S1 | S2 | S3 | S4
+#     - 11 (S1+S2 fused):             S1+S2 | S3 | S4
+#     - 17b (+ 4-row unroll-and-jam): S1+S2 | S3 | S4
+#     - 19_mk (all 4 fused, panels):  one block (its stages are interleaved)
+# - How: fresh copies of A, x, w for every run (as in run_benchmark), then the
+#   stages IN ORDER with a timestamp between them. Versions alternate every
+#   round; median of >= 9 rounds.
+# - Why not time each stage alone on a fresh copy: right after the copy, A is
+#   read at DRAM speed even at N=512 (23 GB/s, vs 84 GB/s once a stage has used
+#   it), so S2 alone took 3x longer than S2 right after S1.
+# - Check: a version's stage times should add up to its whole-kernel time
+#   (the 4 calls from Python add ~1 us in total).
+# - Expect at N=4096 (memory-bound, so time ~ passes over A):
+#     - S1 reads + writes A (2 passes) ~ 50%; S2 and S4 read A once ~ 25% each;
+#       S3 touches only vectors ~ 0%.
+#     - Fusing S1+S2 removes S2's pass; the panels also remove S4's (ideal case).
+# - Observed (5900X):
+#     - N=4096: S1 48%, S2 27%, S4 25%, S3 0% -> time follows passes (2:1:1).
+#       Fused S1+S2 (9.7 ms in 17b) costs about what S1 alone did (10.6 ms):
+#       S2's pass is gone. S4 stays ~5.4 ms (its own pass) until panels.
+#     - N=512: S1 63% (first pass after the copy, A from DRAM); S2 and S4 then
+#       read A from cache at 80-95 GB/s, so fusion saves less at this size.
+# - Output: table, results/breakdown_N<N>.csv, stacked bar PNG
+#   (results/breakdown_N<N>.png, or the .png path given on the command line).
+# ---------------------------------------------------------
+
+# Baseline 3's loops, one stage each: the same Python code as Baseline 2's
+# building blocks (orders ij, ji, -, ij), compiled with fastmath like Baseline 3.
+_bd_s1 = njit(fastmath=True)(_stage1_ij.py_func)
+_bd_s2 = njit(fastmath=True)(_stage2_ji.py_func)
+_bd_s3 = njit(fastmath=True)(_stage3.py_func)
+_bd_s4 = njit(fastmath=True)(_stage4_ij.py_func)
+
+
+@njit(fastmath=True)
+def _bd_fused12_11(beta, A, u1, v1, u2, v2, x, y):
+    # - Baseline 11's fused S1+S2 loop, copied so it can be timed alone
+    n = A.shape[0]
+    for i in range(n):
+        a1 = u1[i]
+        a2 = u2[i]
+        c = beta * y[i]
+        for j in range(n):
+            a = A[i, j] + a1 * v1[j] + a2 * v2[j]
+            A[i, j] = a
+            x[j] += c * a
+
+
+@njit(fastmath=True)
+def _bd_s4_11(alpha, A, w, x):
+    # - Baseline 11's S4 loop (row sum in a scalar, alpha once per row)
+    n = A.shape[0]
+    for i in range(n):
+        s = 0.0
+        for j in range(n):
+            s += A[i, j] * x[j]
+        w[i] = w[i] + alpha * s
+
+
+# - One color per stage, the same in every bar (fixed categorical slots).
+# - Checked: touching segments stay distinct for normal and color-blind vision.
+BREAKDOWN_COLORS = {
+    "S1": "#2a78d6",            # blue
+    "S2": "#eb6834",            # orange
+    "S3": "#1baf7a",            # aqua
+    "S4": "#6250d6",            # violet
+    "S1+S2": "#eda100",         # yellow (labels on it use dark text)
+    "S1+S2+S3+S4": "#008300",   # green
+}
+BREAKDOWN_LEGEND = {
+    "S1": r"S1: $A$ += $u_1 v_1^T + u_2 v_2^T$",
+    "S2": r"S2: $x$ += $\beta A^T y$",
+    "S3": r"S3: $x$ += $z$",
+    "S4": r"S4: $w$ += $\alpha A x$",
+    "S1+S2": "S1+S2 fused (one pass)",
+    "S1+S2+S3+S4": "S1-S4 fused by column panels",
+}
+
+
+def run_breakdown(n, pw=None):
+    if pw is None:
+        pw = default_panel_width(n)
+    A0, u1, v1, u2, v2, w0, x0, y, z = initialize_gemver(n)
+    a, b = ALPHA, BETA
+    A_exp, x_exp, w_exp = gemver_numpy_reference(a, b, A0, u1, v1, u2, v2, w0, x0, y, z)
+
+    # Each piece gets fresh (A, x, w) and runs one stage or one whole kernel.
+    # 17b's helpers called from Python get (0, n) as run-time values -> same SIMD path as 17b.
+    pieces = {
+        "3:S1": lambda A, x, w: _bd_s1(A, u1, v1, u2, v2),
+        "3:S2": lambda A, x, w: _bd_s2(b, A, x, y),
+        "S3": lambda A, x, w: _bd_s3(x, z),
+        "3:S4": lambda A, x, w: _bd_s4(a, A, w, x),
+        "11:S1+S2": lambda A, x, w: _bd_fused12_11(b, A, u1, v1, u2, v2, x, y),
+        "11:S4": lambda A, x, w: _bd_s4_11(a, A, w, x),
+        "17b:S1+S2": lambda A, x, w: _fused_rows_4(b, A, u1, v1, u2, v2, y, x, 0, n),
+        "17b:S4": lambda A, x, w: _matvec_rows_4(a, A, x, w, 0, n),
+        "3:whole": lambda A, x, w: gemver_opt_flags_3(a, b, A, u1, v1, u2, v2, w, x, y, z),
+        "11:whole": lambda A, x, w: gemver_fused_11(a, b, A, u1, v1, u2, v2, w, x, y, z),
+        "17b:whole": lambda A, x, w: gemver_fused_unroll_jam_17b(a, b, A, u1, v1, u2, v2, w, x, y, z, 0),
+        "19:whole": lambda A, x, w: gemver_fused_panel_mk_19(a, b, A, u1, v1, u2, v2, w, x, y, z, pw),
+    }
+    # (version, [(stage, piece, passes over A)], whole-kernel piece)
+    versions = [
+        ("3: unfused", [("S1", "3:S1", 2), ("S2", "3:S2", 1), ("S3", "S3", 0), ("S4", "3:S4", 1)], "3:whole"),
+        ("11: S1+S2 fused", [("S1+S2", "11:S1+S2", 2), ("S3", "S3", 0), ("S4", "11:S4", 1)], "11:whole"),
+        ("17b: + unroll-and-jam", [("S1+S2", "17b:S1+S2", 2), ("S3", "S3", 0), ("S4", "17b:S4", 1)], "17b:whole"),
+        (f"19_mk: all fused (PW={pw})", [("S1+S2+S3+S4", "19:whole", 2)], "19:whole"),
+    ]
+
+    def run_chain(keys):
+        # fresh A, x, w; run the pieces in order with a timestamp between them
+        A = A0.copy()
+        x = x0.copy()
+        w = w0.copy()
+        stamps = [time.perf_counter()]
+        for k in keys:
+            pieces[k](A, x, w)
+            stamps.append(time.perf_counter())
+        return np.diff(stamps), A, x, w
+
+    # jobs: each version's stage chain, plus its whole kernel when it is split
+    jobs = []
+    for version, stages, whole in versions:
+        jobs.append((version, "stages", [piece for _, piece, _ in stages]))
+        if len(stages) > 1:
+            jobs.append((version, "whole", [whole]))
+
+    correct = {}
+    for version, kind, keys in jobs:       # warm-up (compiles) + correctness of the chain
+        _, A, x, w = run_chain(keys)
+        if kind == "stages":
+            correct[version] = (np.allclose(A, A_exp, rtol=1e-5, atol=1e-5)
+                                and np.allclose(x, x_exp, rtol=1e-5, atol=1e-5)
+                                and np.allclose(w, w_exp, rtol=1e-5, atol=1e-5))
+
+    # first round also sets the number of rounds (about 8 s in total, 9 to 201)
+    start = time.perf_counter()
+    times = {(v, kind): [run_chain(keys)[0]] for v, kind, keys in jobs}
+    rounds = int(min(201, max(9, 8.0 / (time.perf_counter() - start))))
+    for r in range(1, rounds):
+        for v, kind, keys in (jobs if r % 2 == 0 else jobs[::-1]):
+            times[(v, kind)].append(run_chain(keys)[0])
+
+    results = []
+    for version, stages, _ in versions:
+        stage_med = np.median(np.array(times[(version, "stages")]), axis=0)   # per stage
+        whole = times.get((version, "whole"))
+        results.append({
+            "version": version,
+            "stages": [(stage, float(t), passes) for (stage, _, passes), t in zip(stages, stage_med)],
+            "whole": float(np.median([t[0] for t in whole])) if whole else float(stage_med.sum()),
+            "correct": correct[version],
+        })
+    return results, rounds, pw
+
+
+def stage_bytes(passes, n):
+    # A stages: passes x 8N^2. S3 (no pass over A): reads x, z and writes x = 3 x 8N.
+    return passes * 8.0 * n * n if passes else 3 * 8.0 * n
+
+
+def fmt_ms(ms):
+    return f"{ms:.1f}" if ms >= 10 else f"{ms:.2f}" if ms >= 1 else f"{ms:.3f}"
+
+
+def report_breakdown(n, pw=None, image_path=None, markdown=False):
+    print(f"\nRunning GEMVER Per-Stage Breakdown for N={n}...")
+    print(f"CPU: {CPU_NAME}")
+    results, rounds, pw = run_breakdown(n, pw)
+    print(f"Median of {rounds} rounds (fresh A, x, w every run; stages timed in order). "
+          f"Baseline 19 panel width: {pw}\n")
+
+    # rows shared by the table and the CSV
+    rows = []
+    for r in results:
+        total = sum(t for _, t, _ in r["stages"])
+        for stage, t, passes in r["stages"]:
+            rows.append((r["version"], stage, t, 100 * t / total, passes,
+                         stage_bytes(passes, n) / t / 1e9, total, r["whole"]))
+
+    if markdown:
+        print("| Version | Stage | Time (ms) | % of total | Passes over A | GB/s |")
+        print("| :--- | :--- | :--- | :--- | :--- | :--- |")
+        for version, stage, t, pct, passes, gbps, _, _ in rows:
+            print(f"| {version} | {stage} | {t * 1e3:.3f} | {pct:.0f}% | {passes} | {gbps:.1f} |")
+        print()
+
+    header = (f"| {'Version':<26} | {'Stage':<13} | {'Time (ms)':>10} | {'% of total':>10} "
+              f"| {'Passes':>6} | {'GB/s':>7} |")
+    divider = "-" * len(header)
+    print(divider)
+    print(header)
+    print(divider)
+    for r in results:
+        total = sum(t for _, t, _ in r["stages"])
+        for stage, t, passes in r["stages"]:
+            gbps = stage_bytes(passes, n) / t / 1e9
+            print(f"| {r['version']:<26} | {stage:<13} | {t * 1e3:10.3f} | {100 * t / total:9.0f}% "
+                  f"| {passes:>6} | {gbps:7.1f} |")
+        passes_total = sum(p for _, _, p in r["stages"])
+        print(f"| {'':<26} | {'sum of stages':<13} | {total * 1e3:10.3f} | {100:9.0f}% "
+              f"| {passes_total:>6} | {'':>7} |")
+        print(f"| {'':<26} | {'whole kernel':<13} | {r['whole'] * 1e3:10.3f} | {'':>10} "
+              f"| {'':>6} | {'':>7} |")
+        print(divider)
+    print("Stages run in order vs NumPy reference: " + ", ".join(
+        f"{r['version'].split(':')[0]} {'PASS' if r['correct'] else 'FAIL'}" for r in results))
+    print("GB/s = passes x size of A / time (S3: its three vectors).")
+
+    csv_path = os.path.join(RESULTS_DIR, f"breakdown_N{n}.csv")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    import csv
+    with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("n", "version", "stage", "time_s", "pct_of_version", "passes_over_A",
+                         "gbps", "version_sum_s", "whole_kernel_s"))
+        for version, stage, t, pct, passes, gbps, total, whole in rows:
+            writer.writerow((n, version, stage, f"{t:.9f}", f"{pct:.1f}", passes, f"{gbps:.2f}",
+                             f"{total:.9f}", f"{whole:.9f}"))
+    print(f"CSV written to {csv_path}")
+
+    plot_breakdown(results, n, rounds, image_path or os.path.join(RESULTS_DIR, f"breakdown_N{n}.png"),
+                   show=image_path is None)
+
+
+def plot_breakdown(results, n, rounds, path, show):
+    # Horizontal stacked bars: one bar per version, one segment per stage.
+    surface, ink, ink2, muted = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
+    grid, axis_color = "#e1e0d9", "#c3c2b7"
+
+    fig, ax = plt.subplots(figsize=(12, 5), facecolor=surface)
+    fig.subplots_adjust(left=0.2, right=0.97, top=0.72, bottom=0.13)
+    ax.set_facecolor(surface)
+
+    totals = [sum(t for _, t, _ in r["stages"]) * 1e3 for r in results]
+    longest = max(totals)
+    ax.set_xlim(0, longest * 1.22)
+    ax.set_ylim(len(results) - 0.5, -0.5)          # first version on top
+
+    labels = []
+    for row, r in enumerate(results):
+        left = 0.0
+        for stage, t, _ in r["stages"]:
+            width = t * 1e3
+            ax.barh(row, width, left=left, height=0.5, color=BREAKDOWN_COLORS[stage],
+                    edgecolor=surface, linewidth=1.5)      # surface-colored gap between segments
+            labels.append((row, left, width, f"{stage}  {fmt_ms(width)} ms",
+                           ink if stage == "S1+S2" else "#ffffff"))
+            left += width
+        # bar tip: sum of the stages; the whole kernel timed in one call, when it is split
+        tip = f"{fmt_ms(left)} ms"
+        if len(r["stages"]) > 1:
+            tip += f"\nwhole kernel {fmt_ms(r['whole'] * 1e3)} ms"
+        ax.text(left + 0.01 * longest, row, tip, va="center", ha="left", fontsize=9.5,
+                color=ink, linespacing=1.4)
+
+    # label inside a segment only where it fits with padding (S3 is usually too thin)
+    renderer = fig.canvas.get_renderer()
+    for row, left, width, text, color in labels:
+        label = ax.text(left + width / 2, row, text, ha="center", va="center", fontsize=9, color=color)
+        x0 = ax.transData.transform((left, row))[0]
+        x1 = ax.transData.transform((left + width, row))[0]
+        if label.get_window_extent(renderer).width + 12 > x1 - x0:
+            label.remove()
+
+    ax.set_yticks(range(len(results)))
+    ax.set_yticklabels([f"{r['version']}\n{sum(p for _, _, p in r['stages'])} passes over A"
+                        for r in results], color=ink2, fontsize=10)
+    ax.tick_params(axis="y", length=0)
+    ax.tick_params(axis="x", colors=muted)
+    ax.xaxis.grid(True, color=grid, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(axis_color)
+    ax.set_xlabel("Time per GEMVER call (ms), lower is better", color=ink2)
+
+    from matplotlib.patches import Patch
+    handles = [Patch(facecolor=c, label=BREAKDOWN_LEGEND[s]) for s, c in BREAKDOWN_COLORS.items()]
+    ax.legend(handles=handles, loc="lower left", bbox_to_anchor=(0, 1.02), ncol=3,
+              frameon=False, fontsize=9, labelcolor=ink2)
+    fig.text(0.2, 0.95, f"Where GEMVER's time goes, stage by stage (N={n})",
+             fontsize=13, color=ink, ha="left")
+    fig.text(0.2, 0.905, f"Stages timed in order inside each run, median of {rounds} rounds | CPU: {CPU_NAME}",
+             fontsize=9, color=muted, ha="left")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=300, facecolor=surface)
+    print(f"Plot saved to {path}")
+    if show:
+        plt.show()
+
+
+# ---------------------------------------------------------
 # Assembly Check
 # ---------------------------------------------------------
 # Run with:  python gemver_numba_bench.py <N> asm
@@ -2030,13 +2331,14 @@ def write_results_csv(rows, n, path):
 # ---------------------------------------------------------
 # Command line: python gemver_numba_bench.py [N] [mode words] [image.png] [--pw W]
 # - N: matrix size (default 512).
-# - Mode words (any order): threads, asm, blas_mt, md.
+# - Mode words (any order): threads, asm, blas_mt, md, breakdown.
 #     - md: print the results as a Markdown table (matmul.md format)
 #       and save it as results/gemver_results_N<N>.md.
+#     - breakdown: time per stage instead of the baseline table.
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
 # - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
-MODES = ("threads", "asm", "blas_mt", "md")
+MODES = ("threads", "asm", "blas_mt", "md", "breakdown")
 RESULTS_DIR = "results"
 
 def parse_args(argv):
@@ -2081,6 +2383,9 @@ if __name__ == "__main__":
         sys.exit(0)
     if "asm" in modes:
         report_asm(N_input)
+        sys.exit(0)
+    if "breakdown" in modes:
+        report_breakdown(N_input, pw, image_path, markdown="md" in modes)
         sys.exit(0)
 
     print(f"\nRunning GEMVER Benchmarks for N={N_input}"
