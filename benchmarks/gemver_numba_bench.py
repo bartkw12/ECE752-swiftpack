@@ -2296,6 +2296,24 @@ def free_ram_bytes():
     return None
 
 
+def check_and_time_warm(fn, inputs, expected, extra=(), single=False, min_time=0.3):
+    # - First call on fresh copies of A, x, w: compiles if needed, result checked vs NumPy.
+    # - Then the same arrays again and again ("warm"): median of >= 9 calls and >= min_time s.
+    # - single: time one call only (pure Python is too slow to repeat).
+    # - Returns (median seconds, correct).
+    A0, u1, v1, u2, v2, w0, x0, y, z = inputs
+    A, x, w = A0.copy(), x0.copy(), w0.copy()
+    fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
+    correct = all(np.allclose(got, want, rtol=1e-5, atol=1e-5)
+                  for got, want in zip((A, x, w), expected))
+    times = []
+    while len(times) < (1 if single else 9) or (not single and sum(times) < min_time and len(times) < 200):
+        start = time.perf_counter()
+        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
+        times.append(time.perf_counter() - start)
+    return float(np.median(times)), correct
+
+
 def run_scale(sizes):
     # Per N: NumPy check on fresh copies, then warm timing. Returns (rows, sizes that ran).
     rows, ran = [], []
@@ -2306,8 +2324,8 @@ def run_scale(sizes):
         if free is not None and need > free:
             print(f"N={n:5d}: skipped, needs about {need / 1e9:.1f} GB of RAM ({free / 1e9:.1f} GB free)")
             continue
-        A0, u1, v1, u2, v2, w0, x0, y, z = initialize_gemver(n)
-        A_exp, x_exp, w_exp = gemver_numpy_reference(ALPHA, BETA, A0, u1, v1, u2, v2, w0, x0, y, z)
+        inputs = initialize_gemver(n)
+        expected = gemver_numpy_reference(ALPHA, BETA, *inputs)
         flops = gemver_flop_count(n)
         pw = default_panel_width(n)
         start = time.perf_counter()
@@ -2318,23 +2336,12 @@ def run_scale(sizes):
                 continue
             # arguments after z: 17b's start row, Baseline 19's panel width
             extra = (0,) if name.startswith("17b_") else (pw,) if name.startswith("19_") else ()
-            A, x, w = A0.copy(), x0.copy(), w0.copy()
-            fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)     # compiles; result checked
-            correct = (np.allclose(A, A_exp, rtol=1e-5, atol=1e-5)
-                       and np.allclose(x, x_exp, rtol=1e-5, atol=1e-5)
-                       and np.allclose(w, w_exp, rtol=1e-5, atol=1e-5))
-            # warm timing: same arrays again (same work, A in cache when it fits)
-            times = []
-            while len(times) < (1 if python else 9) or (not python and sum(times) < 0.3 and len(times) < 200):
-                t0 = time.perf_counter()
-                fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
-                times.append(time.perf_counter() - t0)
-            elapsed = float(np.median(times))
+            elapsed, correct = check_and_time_warm(fn, inputs, expected, extra, single=python)
             rows.append({"n": n, "name": name, "gflops": flops / elapsed / 1e9, "time_s": elapsed,
                          "passes": gemver_passes_over_A(name), "pw": pw if name.startswith("19_") else "",
                          "correct": correct})
             count += 1
-        del A, x, w
+        del inputs, expected
         note = "" if n <= SCALE_PYTHON_MAX_N else "  (Baseline 0 skipped: pure Python, too slow)"
         print(f"N={n:5d}  A = {8.0 * n * n / 1e6:6.1f} MB ({cache_level(n):>4})  PW = {pw:4d}  "
               f"{count:2d} kernels in {time.perf_counter() - start:5.1f} s{note}", flush=True)
@@ -2535,6 +2542,482 @@ def plot_scale(by_name, sizes, bw_peak, path, show):
 
 
 # ---------------------------------------------------------
+# Search Space
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py <N> search   (add "md" for Markdown tables)
+# - Professor: discuss the search space (how big it is, what was measured,
+#   how it was cut down).
+# - Full space, as an upper bound (many combinations are illegal or pointless,
+#   e.g. 24 threads with no parallel loop):
+#     loop order 8 x fastmath 2 x parallel loop 3 x threads 8 x panel width 8
+#     x rows per step 4 x fusion grouping 3 = 36,864 combinations
+# - Cut down like a coordinate search: keep the best choice for the other
+#   dimensions and sweep one or two dimensions at a time:
+#     1. Loop order (ij/ji for S1, S2, S4) x fastmath: 16 unfused kernels.
+#     2. Baseline 19 (all 4 stages fused): panel width x rows per step {1, 2, 4, 8}.
+#     3. 19_par: panel width x threads (4 rows per step).
+# - Timing: warm, as in scale mode; every configuration is checked against NumPy.
+# - Expect:
+#     1. S2's order matters most (ji reads A^T by rows = stride 1). fastmath
+#        matters for S4 ij (a sum: SIMD needs the additions reordered).
+#     2. Wider panels are faster (longer row pieces) until PW = N (one panel, so
+#        S4 is not fused). 4 rows beat 1; 8 rows may not fit in 16 vector registers.
+#     3. Best at a few threads: GEMVER is memory-bound (as in the thread sweep).
+# - Observed (5900X, N=4096; other programs were running, so cells move by ~15%):
+#     1. Only the order with ALL stages stride-1 (ij ji ij) is fast: 7.8 GFLOP/s,
+#        the next one 1.6. One strided stage alone costs ~100 ms (column walk over
+#        134 MB), so no single stage "dominates": S1 2.5x, S2 2.1x, S4 2.0x
+#        (geometric mean). fastmath: 1.24x on ij ji ij, ~1.0x on the strided ones.
+#     2. Wider panels are faster for every row count (PW <= 256: 6-10 GFLOP/s,
+#        PW >= 2048: 10-13). 1 row is slowest; 2, 4, 8 rows are close.
+#        One panel (PW = N, 3 passes) is as fast as PW = 2048: the shorter
+#        row pieces cost what the saved pass gains. Best 13.3 ~ 17b (13.4).
+#     3. 19_par: 1-4 threads with wide panels are best (~14 GFLOP/s);
+#        12-24 threads give ~10.5 for every panel width.
+# - Output: tables, results/search_N<N>.csv, results/search_heatmap_N<N>.png.
+# ---------------------------------------------------------
+SEARCH_ROWS = (1, 2, 4, 8)
+DESIGN_SPACE = (
+    ("loop order (ij/ji for S1, S2, S4)", 8),
+    ("fastmath on/off", 2),
+    ("parallel loop: none/rows/inner", 3),
+    ("threads 1 ... 24", 8),
+    ("tile/panel width 32 ... N", 8),
+    ("rows per step 1/2/4/8", 4),
+    ("fusion: none/S1+S2/all four", 3),
+)
+
+
+def search_panel_widths(n):
+    # 32 ... 2048 below N, then N itself (one panel)
+    return [pw for pw in (32, 64, 128, 256, 512, 1024, 2048) if pw < n] + [n]
+
+
+def _stage_set(fastmath):
+    # Baseline 2's stage helpers (same Python code), compiled with or without fastmath
+    jit = njit(fastmath=fastmath)
+    return {"S1": {"ij": jit(_stage1_ij.py_func), "ji": jit(_stage1_ji.py_func)},
+            "S2": {"ij": jit(_stage2_ij.py_func), "ji": jit(_stage2_ji.py_func)},
+            "S3": jit(_stage3.py_func),
+            "S4": {"ij": jit(_stage4_ij.py_func), "ji": jit(_stage4_ji.py_func)}}
+
+
+_ORDER_STAGES = {False: _stage_set(False), True: _stage_set(True)}
+
+
+def make_order_kernel(o1, o2, o4, fastmath):
+    # - GEMVER with loop order o1 for S1, o2 for S2, o4 for S4 (8 combinations)
+    stages = _ORDER_STAGES[fastmath]
+    s1, s2, s3, s4 = stages["S1"][o1], stages["S2"][o2], stages["S3"], stages["S4"][o4]
+
+    @njit(fastmath=fastmath)
+    def kernel(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+        s1(A, u1, v1, u2, v2)
+        s2(beta, A, x, y)
+        s3(x, z)
+        s4(alpha, A, w, x)
+    return kernel
+
+
+@njit(fastmath=True)
+def _panel_s12_rows2(beta, A, u1, v1, u2, v2, y, xp, jb, je, row_start, row_end):
+    # - _panel_s12_rows4 with 2 rows per step
+    m = je - jb
+    v1p = v1[jb:je]
+    v2p = v2[jb:je]
+    i = row_start
+    while i + 2 <= row_end:
+        r0 = A[i, jb:je]
+        r1 = A[i + 1, jb:je]
+        a10 = u1[i]
+        a11 = u1[i + 1]
+        a20 = u2[i]
+        a21 = u2[i + 1]
+        c0 = beta * y[i]
+        c1 = beta * y[i + 1]
+        for j in range(m):
+            p = v1p[j]
+            q = v2p[j]
+            e0 = r0[j] + a10 * p + a20 * q
+            e1 = r1[j] + a11 * p + a21 * q
+            r0[j] = e0
+            r1[j] = e1
+            xp[j] += c0 * e0 + c1 * e1
+        i += 2
+    _panel_s12_rows1(beta, A, u1, v1, u2, v2, y, xp, jb, je, i, row_end)
+
+
+@njit(fastmath=True)
+def _panel_s4_rows2(alpha, A, x, w, jb, je, row_start, row_end):
+    # - _panel_s4_rows4 with 2 rows per step
+    m = je - jb
+    xp = x[jb:je]
+    i = row_start
+    while i + 2 <= row_end:
+        r0 = A[i, jb:je]
+        r1 = A[i + 1, jb:je]
+        s0 = 0.0
+        s1 = 0.0
+        for j in range(m):
+            xj = xp[j]
+            s0 += r0[j] * xj
+            s1 += r1[j] * xj
+        w[i] += alpha * s0
+        w[i + 1] += alpha * s1
+        i += 2
+    _panel_s4_rows1(alpha, A, x, w, jb, je, i, row_end)
+
+
+@njit(fastmath=True)
+def _panel_s12_rows8(beta, A, u1, v1, u2, v2, y, xp, jb, je, row_start, row_end):
+    # - _panel_s12_rows4 with 8 rows per step: v1[j], v2[j], xp[j] reused 8 times,
+    #   but 24 per-row values (u1, u2, beta*y) compete for 16 vector registers
+    m = je - jb
+    v1p = v1[jb:je]
+    v2p = v2[jb:je]
+    i = row_start
+    while i + 8 <= row_end:
+        r0, r1, r2, r3 = A[i, jb:je], A[i + 1, jb:je], A[i + 2, jb:je], A[i + 3, jb:je]
+        r4, r5, r6, r7 = A[i + 4, jb:je], A[i + 5, jb:je], A[i + 6, jb:je], A[i + 7, jb:je]
+        a10, a11, a12, a13 = u1[i], u1[i + 1], u1[i + 2], u1[i + 3]
+        a14, a15, a16, a17 = u1[i + 4], u1[i + 5], u1[i + 6], u1[i + 7]
+        a20, a21, a22, a23 = u2[i], u2[i + 1], u2[i + 2], u2[i + 3]
+        a24, a25, a26, a27 = u2[i + 4], u2[i + 5], u2[i + 6], u2[i + 7]
+        c0, c1, c2, c3 = beta * y[i], beta * y[i + 1], beta * y[i + 2], beta * y[i + 3]
+        c4, c5, c6, c7 = beta * y[i + 4], beta * y[i + 5], beta * y[i + 6], beta * y[i + 7]
+        for j in range(m):
+            p = v1p[j]
+            q = v2p[j]
+            e0 = r0[j] + a10 * p + a20 * q
+            e1 = r1[j] + a11 * p + a21 * q
+            e2 = r2[j] + a12 * p + a22 * q
+            e3 = r3[j] + a13 * p + a23 * q
+            e4 = r4[j] + a14 * p + a24 * q
+            e5 = r5[j] + a15 * p + a25 * q
+            e6 = r6[j] + a16 * p + a26 * q
+            e7 = r7[j] + a17 * p + a27 * q
+            r0[j] = e0
+            r1[j] = e1
+            r2[j] = e2
+            r3[j] = e3
+            r4[j] = e4
+            r5[j] = e5
+            r6[j] = e6
+            r7[j] = e7
+            xp[j] += (c0 * e0 + c1 * e1 + c2 * e2 + c3 * e3
+                      + c4 * e4 + c5 * e5 + c6 * e6 + c7 * e7)
+        i += 8
+    _panel_s12_rows1(beta, A, u1, v1, u2, v2, y, xp, jb, je, i, row_end)
+
+
+@njit(fastmath=True)
+def _panel_s4_rows8(alpha, A, x, w, jb, je, row_start, row_end):
+    # - _panel_s4_rows4 with 8 rows per step: x[j] loaded once for 8 sums
+    m = je - jb
+    xp = x[jb:je]
+    i = row_start
+    while i + 8 <= row_end:
+        r0, r1, r2, r3 = A[i, jb:je], A[i + 1, jb:je], A[i + 2, jb:je], A[i + 3, jb:je]
+        r4, r5, r6, r7 = A[i + 4, jb:je], A[i + 5, jb:je], A[i + 6, jb:je], A[i + 7, jb:je]
+        s0 = s1 = s2 = s3 = s4 = s5 = s6 = s7 = 0.0
+        for j in range(m):
+            xj = xp[j]
+            s0 += r0[j] * xj
+            s1 += r1[j] * xj
+            s2 += r2[j] * xj
+            s3 += r3[j] * xj
+            s4 += r4[j] * xj
+            s5 += r5[j] * xj
+            s6 += r6[j] * xj
+            s7 += r7[j] * xj
+        w[i] += alpha * s0
+        w[i + 1] += alpha * s1
+        w[i + 2] += alpha * s2
+        w[i + 3] += alpha * s3
+        w[i + 4] += alpha * s4
+        w[i + 5] += alpha * s5
+        w[i + 6] += alpha * s6
+        w[i + 7] += alpha * s7
+        i += 8
+    _panel_s4_rows1(alpha, A, x, w, jb, je, i, row_end)
+
+
+def _make_panel_kernel(s12, s4):
+    # - The loop of gemver_fused_panel_mk_19, with other row helpers
+    @njit(fastmath=True)
+    def kernel(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, pw):
+        n = A.shape[0]
+        for jb in range(0, n, pw):
+            je = min(jb + pw, n)
+            s12(beta, A, u1, v1, u2, v2, y, x[jb:je], jb, je, 0, n)
+            for j in range(jb, je):
+                x[j] = x[j] + z[j]
+            s4(alpha, A, x, w, jb, je, 0, n)
+    return kernel
+
+
+# rows per step -> serial panel kernel (1 row = Baseline 19, 4 rows = Baseline 19_mk)
+PANEL_ROW_KERNELS = {
+    1: gemver_fused_panel_19,
+    2: _make_panel_kernel(_panel_s12_rows2, _panel_s4_rows2),
+    4: gemver_fused_panel_mk_19,
+    8: _make_panel_kernel(_panel_s12_rows8, _panel_s4_rows8),
+}
+
+
+def run_search(n):
+    # The three sweeps; every row: sweep, configuration, GFLOP/s, time, correct.
+    inputs = initialize_gemver(n)
+    expected = gemver_numpy_reference(ALPHA, BETA, *inputs)
+    flops = gemver_flop_count(n)
+    rows = []
+
+    def measure(sweep, fn, extra=(), **config):
+        elapsed, correct = check_and_time_warm(fn, inputs, expected, extra)
+        rows.append(dict(sweep=sweep, gflops=flops / elapsed / 1e9, time_s=elapsed,
+                         correct=correct, **config))
+
+    def done(label, start):
+        count = sum(1 for r in rows if r["sweep"] == label)
+        print(f"  {label:<14} {count:3d} configurations in {time.perf_counter() - start:5.1f} s", flush=True)
+
+    # references without panels
+    start = time.perf_counter()
+    measure("reference", gemver_opt_flags_3, name="3_fastmath_ij_ji_ij")
+    measure("reference", gemver_fused_unroll_jam_17b, (0,), name="17b_unroll_jam_runtime_start")
+    done("reference", start)
+
+    # 1. loop order x fastmath
+    start = time.perf_counter()
+    for fastmath in (False, True):
+        for o1 in ("ij", "ji"):
+            for o2 in ("ij", "ji"):
+                for o4 in ("ij", "ji"):
+                    measure("loop_order", make_order_kernel(o1, o2, o4, fastmath),
+                            s1=o1, s2=o2, s4=o4, fastmath=fastmath)
+    done("loop_order", start)
+
+    # 2. Baseline 19: panel width x rows per step
+    pws = search_panel_widths(n)
+    start = time.perf_counter()
+    for r in SEARCH_ROWS:
+        for pw in pws:
+            measure("panel_rows", PANEL_ROW_KERNELS[r], (pw,), pw=pw, rows=r)
+    done("panel_rows", start)
+
+    # 3. 19_par: threads x panel width
+    max_threads = get_num_threads()
+    threads = [t for t in THREAD_COUNTS if t <= max_threads]
+    start = time.perf_counter()
+    for t in threads:
+        set_num_threads(t)
+        for pw in pws:
+            measure("threads_panel", gemver_fused_panel_par_19, (pw,), pw=pw, threads=t, rows=4)
+    set_num_threads(max_threads)
+    done("threads_panel", start)
+    return rows, pws, threads
+
+
+def format_table(head, body, markdown, left=1):
+    # Box table (terminal) or Markdown; the first `left` columns are left-aligned
+    if markdown:
+        lines = ["| " + " | ".join(head) + " |", "| " + " | ".join(":---" for _ in head) + " |"]
+        return "\n".join(lines + ["| " + " | ".join(row) + " |" for row in body])
+    widths = [max(len(row[k]) for row in [head] + body) for k in range(len(head))]
+    fmt = lambda row: "| " + " | ".join(
+        c.ljust(wd) if k < left else c.rjust(wd) for k, (c, wd) in enumerate(zip(row, widths))) + " |"
+    divider = "-" * len(fmt(head))
+    return "\n".join([divider, fmt(head), divider] + [fmt(row) for row in body] + [divider])
+
+
+def report_search(n, image_path=None, markdown=False):
+    print(f"\nRunning GEMVER Search-Space Sweep for N={n} "
+          f"(A = {8.0 * n * n / 1e6:.1f} MB, fits in {cache_level(n)})...")
+    print(f"CPU: {CPU_NAME}")
+    print("Warm timing (same arrays called repeatedly); every configuration checked against NumPy.\n")
+
+    total = int(np.prod([k for _, k in DESIGN_SPACE]))
+    print("Design space (upper bound):")
+    for label, k in DESIGN_SPACE:
+        print(f"  {label:<36} x {k}")
+    print(f"  {'= combinations':<36}   {total:,}\n")
+
+    start = time.perf_counter()
+    rows, pws, threads = run_search(n)
+    print(f"Search took {time.perf_counter() - start:.0f} s. Numba threading layer: {threading_layer()}")
+    bw_serial, bw_by_threads = measure_bandwidth()
+    bw_peak = max(bw_serial, max(bw_by_threads.values()))
+    roofs = {p: scale_roof(p, bw_peak) for p in (4, 3, 2)}
+    print(f"Measured memory bandwidth: {bw_peak:.1f} GB/s -> DRAM roofs: "
+          + ", ".join(f"{p} passes {g:.1f}" for p, g in roofs.items()) + " GFLOP/s\n")
+
+    refs = {r["name"].split("_")[0]: r for r in rows if r["sweep"] == "reference"}
+    tables = []
+
+    # 1. loop orders, fastest first
+    loop = sorted((r for r in rows if r["sweep"] == "loop_order"), key=lambda r: r["time_s"])
+    best = loop[0]["time_s"]
+    stride1 = lambda r: " ".join(s for s, ok in (("S1", r["s1"] == "ij"), ("S2", r["s2"] == "ji"),
+                                                 ("S4", r["s4"] == "ij")) if ok) or "none"
+    body = [[str(k + 1), r["s1"], r["s2"], r["s4"], "on" if r["fastmath"] else "off", stride1(r),
+             f"{r['gflops']:.2f}", f"{r['time_s'] * 1e3:.3f}", f"{r['time_s'] / best:.2f}x",
+             "PASS" if r["correct"] else "FAIL"] for k, r in enumerate(loop)]
+    tables.append(("1. Loop order (S1 S2 S4) x fastmath, fastest first",
+                   format_table(["Rank", "S1", "S2", "S4", "fastmath", "Stride-1 stages", "GFLOP/s",
+                                 "Time (ms)", "Slower by", "Correct"], body, markdown, left=6)))
+
+    # - How much each single choice matters: time with the other choice / time with
+    #   this one, over the 8 pairs that differ only in that choice (geometric mean)
+    def effect(key, good, bad):
+        ratios = []
+        for r in loop:
+            if r[key] == good:
+                other = next(q for q in loop if q[key] == bad and all(
+                    q[k] == r[k] for k in ("s1", "s2", "s4", "fastmath") if k != key))
+                ratios.append(other["time_s"] / r["time_s"])
+        return float(np.exp(np.mean(np.log(ratios)))), min(ratios), max(ratios)
+
+    effects = sorted([("S2 ji instead of ij (A^T read by rows)", *effect("s2", "ji", "ij")),
+                      ("S1 ij instead of ji (A read by rows)", *effect("s1", "ij", "ji")),
+                      ("S4 ij instead of ji (A read by rows)", *effect("s4", "ij", "ji")),
+                      ("fastmath on instead of off", *effect("fastmath", True, False))],
+                     key=lambda e: -e[1])
+    body = [[label, f"{g:.2f}x", f"{lo:.2f}x - {hi:.2f}x"] for label, g, lo, hi in effects]
+    tables.append(("How much each choice matters (speedup, geometric mean over the 8 pairs "
+                   "that differ only in it)", format_table(["Choice", "Speedup", "Range"], body, markdown)))
+
+    # 2. and 3. heatmap grids (best cell marked with *)
+    def grid(sweep, key, keys, label):
+        cell = {(r[key], r["pw"]): r for r in rows if r["sweep"] == sweep}
+        top = max(cell.values(), key=lambda r: r["gflops"])
+        head = [f"{label} \\ PW"] + [f"{pw}" + (" (1 panel)" if pw == n else "") for pw in pws]
+        body = [[str(k)] + [f"{cell[(k, pw)]['gflops']:.2f}" + ("*" if cell[(k, pw)] is top else "")
+                            for pw in pws] for k in keys]
+        return format_table(head, body, markdown), top
+
+    text, best_panel = grid("panel_rows", "rows", SEARCH_ROWS, "Rows per step")
+    tables.append(("2. Baseline 19 (serial): GFLOP/s by panel width and rows per step (* = best)", text))
+    text, best_par = grid("threads_panel", "threads", threads, "Threads")
+    tables.append(("3. 19_par: GFLOP/s by panel width and threads (4 rows per step, * = best)", text))
+
+    for title, text in tables:
+        print(title)
+        print(text + "\n")
+
+    # Summary
+    default_pw = default_panel_width(n)
+    mk_default = next(r for r in rows if r["sweep"] == "panel_rows" and r["rows"] == 4 and r["pw"] == default_pw)
+    par_default = next(r for r in rows if r["sweep"] == "threads_panel"
+                       and r["threads"] == threads[-1] and r["pw"] == default_pw)
+    bad = [r for r in rows if not r["correct"]]
+    print("Summary")
+    print(f"  Best loop order:  {loop[0]['s1']} {loop[0]['s2']} {loop[0]['s4']}, fastmath "
+          f"{'on' if loop[0]['fastmath'] else 'off'}: {loop[0]['gflops']:.2f} GFLOP/s "
+          f"(Baseline 3: {refs['3']['gflops']:.2f})")
+    print(f"  Best serial 19:   PW={best_panel['pw']}, {best_panel['rows']} rows per step: "
+          f"{best_panel['gflops']:.2f} GFLOP/s (19_mk default PW={default_pw}: {mk_default['gflops']:.2f}; "
+          f"17b without panels: {refs['17b']['gflops']:.2f})")
+    print(f"  Best 19_par:      {best_par['threads']} threads, PW={best_par['pw']}: {best_par['gflops']:.2f} "
+          f"GFLOP/s (default {threads[-1]} threads, PW={default_pw}: {par_default['gflops']:.2f})")
+    print(f"  Measured {len(rows)} of {total:,} combinations ({100 * len(rows) / total:.2f}%); "
+          + ("all PASS" if not bad else f"{len(bad)} FAIL"))
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    stem = os.path.join(RESULTS_DIR, f"search_N{n}")
+    if markdown:
+        with open(stem + ".md", "w", encoding="utf-8") as fh:
+            fh.write("\n\n".join(f"{title}\n\n{text}" for title, text in tables) + "\n")
+        print(f"\nMarkdown tables written to {stem}.md")
+
+    import csv
+    with open(stem + ".csv", "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("n", "sweep", "name", "s1_order", "s2_order", "s4_order", "fastmath",
+                         "panel_width", "rows_per_step", "threads", "gflops", "time_s", "correct"))
+        for r in rows:
+            writer.writerow((n, r["sweep"], r.get("name", ""), r.get("s1", ""), r.get("s2", ""),
+                             r.get("s4", ""), r.get("fastmath", ""), r.get("pw", ""), r.get("rows", ""),
+                             r.get("threads", ""), f"{r['gflops']:.4f}", f"{r['time_s']:.9f}",
+                             "PASS" if r["correct"] else "FAIL"))
+    print(f"CSV written to {stem}.csv")
+
+    plot_search(rows, pws, threads, n, roofs, refs, image_path or os.path.join(RESULTS_DIR, f"search_heatmap_N{n}.png"),
+                show=image_path is None)
+
+
+def plot_search(rows, pws, threads, n, roofs, refs, path, show):
+    # Two heatmaps with the same color scale and the same x axis (panel width)
+    from matplotlib.colors import LinearSegmentedColormap, Normalize
+    from matplotlib.patches import Rectangle
+    surface, ink, ink2, muted = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
+    # - Sequential: one hue (blue), light = slow, dark = fast
+    ramp = ["#cde2fb", "#b7d3f6", "#9ec5f4", "#86b6ef", "#6da7ec", "#5598e7", "#3987e5",
+            "#2a78d6", "#256abf", "#1c5cab", "#184f95", "#104281", "#0d366b"]
+    cmap = LinearSegmentedColormap.from_list("blue_ramp", ramp)
+
+    grids = []
+    for sweep, key, keys in (("panel_rows", "rows", SEARCH_ROWS), ("threads_panel", "threads", threads)):
+        cell = {(r[key], r["pw"]): r["gflops"] for r in rows if r["sweep"] == sweep}
+        grids.append((keys, np.array([[cell[(k, pw)] for pw in pws] for k in keys])))
+    norm = Normalize(min(g.min() for _, g in grids), max(g.max() for _, g in grids))
+
+    def luminance(rgb):
+        lin = [c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4 for c in rgb]
+        return 0.2126 * lin[0] + 0.7152 * lin[1] + 0.0722 * lin[2]
+
+    fig = plt.figure(figsize=(12, 10), facecolor=surface)
+    gs = fig.add_gridspec(2, 2, height_ratios=[len(SEARCH_ROWS), len(threads)], width_ratios=[1, 0.022],
+                          hspace=0.42, wspace=0.03, left=0.1, right=0.93, top=0.83, bottom=0.08)
+    axes = [fig.add_subplot(gs[0, 0]), fig.add_subplot(gs[1, 0])]
+    titles = ["Baseline 19 (serial): panel width x rows per step",
+              "19_par: panel width x threads (threads split the rows of each panel; 4 rows per step)"]
+    for ax, (keys, values), title, ylabel in zip(axes, grids, titles, ("Rows per step", "Threads")):
+        mesh = ax.pcolormesh(np.arange(len(pws) + 1) - 0.5, np.arange(len(keys) + 1) - 0.5, values,
+                             cmap=cmap, norm=norm, edgecolors=surface, linewidth=2)
+        ax.set_ylim(len(keys) - 0.5, -0.5)                     # first row on top
+        best = np.unravel_index(np.argmax(values), values.shape)
+        for i in range(len(keys)):
+            for j in range(len(pws)):
+                # label color: white or near-black, whichever contrasts more with the cell
+                lum = luminance(cmap(norm(values[i, j]))[:3])
+                white = (1.05) / (lum + 0.05)
+                dark = (lum + 0.05) / (luminance((11 / 255,) * 3) + 0.05)
+                ax.text(j, i, f"{values[i, j]:.1f}", ha="center", va="center", fontsize=9.5,
+                        color="#ffffff" if white >= dark else ink,
+                        fontweight="bold" if (i, j) == best else "normal")
+        ax.add_patch(Rectangle((best[1] - 0.5, best[0] - 0.5), 1, 1, fill=False, edgecolor=ink, linewidth=2.5))
+        ax.set_xticks(range(len(pws)))
+        ax.set_xticklabels([f"{pw}" if pw < n else f"{pw}\n(1 panel)" for pw in pws], color=ink2, fontsize=9.5)
+        ax.set_yticks(range(len(keys)))
+        ax.set_yticklabels([str(k) for k in keys], color=ink2, fontsize=9.5)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+        ax.set_ylabel(ylabel, color=ink2)
+        ax.set_title(title, loc="left", fontsize=11, color=ink, pad=8)
+    axes[1].set_xlabel("Panel width PW (columns per panel)", color=ink2)
+
+    cbar = fig.colorbar(mesh, cax=fig.add_subplot(gs[:, 1]))
+    cbar.outline.set_visible(False)
+    cbar.set_label("GFLOP/s (darker = faster)", color=ink2)
+    cbar.ax.tick_params(colors=muted, length=0)
+
+    fig.text(0.1, 0.955, f"GEMVER search space: Baseline 19 panel width, rows per step and threads (N={n})",
+             fontsize=13, color=ink, ha="left")
+    fig.text(0.1, 0.925, f"GFLOP/s, warm timing, median of >= 9 calls; best cell outlined. "
+             f"DRAM roofs: 3 passes {roofs[3]:.1f}, 2 passes {roofs[2]:.1f} GFLOP/s",
+             fontsize=9.5, color=muted, ha="left")
+    fig.text(0.1, 0.9, f"Without panels: 3 = {refs['3']['gflops']:.1f}, 17b = {refs['17b']['gflops']:.1f} "
+             f"GFLOP/s | CPU: {CPU_NAME}", fontsize=9.5, color=muted, ha="left")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=300, facecolor=surface)
+    print(f"Plot saved to {path}")
+    if show:
+        plt.show()
+
+
+# ---------------------------------------------------------
 # Assembly Check
 # ---------------------------------------------------------
 # Run with:  python gemver_numba_bench.py <N> asm
@@ -2687,10 +3170,11 @@ def write_results_csv(rows, n, path):
 #       and save it as results/gemver_results_N<N>.md.
 #     - breakdown: time per stage instead of the baseline table.
 #     - scale: sweep N = 256 ... 8192 (an N given with it = largest size).
+#     - search: loop orders, panel width x rows, threads x panel width at N.
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
 # - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
-MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale")
+MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale", "search")
 RESULTS_DIR = "results"
 
 def parse_args(argv):
@@ -2738,6 +3222,11 @@ if __name__ == "__main__":
             print("scale: --pw ignored (Baseline 19 uses the default panel width at each N).")
         report_scale(sizes or [N_input], image_path, markdown="md" in modes,
                      stem=os.path.join(RESULTS_DIR, f"scale_to{N_input}" if n_given else "scale"))
+        sys.exit(0)
+    if "search" in modes:
+        if pw_input is not None:
+            print("search: --pw ignored (the panel width is one of the swept dimensions).")
+        report_search(N_input, image_path, markdown="md" in modes)
         sys.exit(0)
 
     # A mode word selects a sweep instead of the baseline table.
