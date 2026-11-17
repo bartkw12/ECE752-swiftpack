@@ -1171,6 +1171,7 @@ def gemver_blas_18(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 #        (the panel was just touched -> it should come from L3, not DRAM)
 # - DRAM traffic: read A once + write A once = 2 passes (11/17: 3).
 #   2 is the minimum: A is an output, so it must be read and written once.
+#   With one panel (PW >= N) pass 2 re-reads all of A, so it is 3, as in 17.
 # - Legal: S2 uses only updated A in its panel; S4 uses only final x and A.
 #   w is summed panel by panel -> different rounding order (fine at 1e-5).
 # - Panel width PW: the panel (N x PW x 8 bytes) must stay in L3 until pass 2.
@@ -1434,8 +1435,13 @@ def measure_bandwidth(reps=10):
 # - BLAS (18): dgemm read + write, then 2 dgemv reads = 4 (the default below).
 # - Column panels (19): read + write from DRAM, pass 2 from L3 = 2
 #   (the ideal; it holds only while the panel stays in L3).
-def gemver_passes_over_A(name):
+# - 19 with ONE panel (PW >= N; the default up to N=1024): pass 2 re-reads all
+#   of A after S1+S2 is done, exactly like S4 in 17 -> 3.
+# - n, pw: only used for 19 (pw=None -> default_panel_width(n)).
+def gemver_passes_over_A(name, n=None, pw=None):
     if name.startswith("19_"):
+        if n is not None and (default_panel_width(n) if pw is None else pw) >= n:
+            return 3
         return 2
     fused = ("11_", "12_", "16_", "17_", "17b_")
     return 3 if name.startswith(fused) else 4
@@ -1443,9 +1449,10 @@ def gemver_passes_over_A(name):
 
 # Roofline hook (used by demos/roofline.py)
 # - Bytes moved = passes over A x 8 bytes x N^2 (vectors are O(N), ignored).
-# - Unfused baselines read/write A 4 times, fused ones 3 times, panels (19) 2 times.
+# - Unfused baselines read/write A 4 times, fused ones 3 times, panels (19) 2 times
+#   (3 with one panel; run_benchmark uses the default panel width).
 def roofline_bytes(name, n):
-    return gemver_passes_over_A(name) * 8.0 * n * n
+    return gemver_passes_over_A(name, n) * 8.0 * n * n
 
 
 # Which BLAS is really called (professor: "make sure the call is the right BLAS")
@@ -1527,6 +1534,38 @@ def gemver_flop_count(n):
 # ---------------------------------------------------------
 # Execution and Benchmarking Routine
 # ---------------------------------------------------------
+# Timing is "warm" in every mode (main table, threads, breakdown, scale, search):
+# - The first call runs on fresh copies of A, x, w: it compiles the kernel, and
+#   its result is checked against NumPy.
+# - The timed calls then pass the SAME arrays again and again, so A stays in the
+#   cache whenever it fits. The matmul benchmark times this way too (A and B
+#   never change there).
+# - Why not a fresh copy before every call (the old way):
+#     - For A between 2 and 32 MB, how much of A the copy leaves in the cache
+#       depends on Windows' memory state, so the time jumped between runs
+#       (17b at N=512: 15 or 23-28 GFLOP/s; warm: 44 on every run).
+#     - Once A is larger than the L3, both ways give the same time.
+# - PolyBench/C flushes the cache before its single timed call (cold start).
+#   The scale mode shows what happens once A no longer fits in the cache.
+def check_and_time_warm(fn, inputs, expected, extra=(), single=False, min_time=0.3):
+    # - inputs: initialize_gemver(N); expected: gemver_numpy_reference(ALPHA, BETA, *inputs).
+    # - extra: arguments after z (17b's start row, Baseline 19's panel width).
+    # - Median of >= 9 calls and >= min_time seconds (at most 200 calls).
+    # - single: time one call only (pure Python is too slow to repeat).
+    # - Returns (median seconds, correct).
+    A0, u1, v1, u2, v2, w0, x0, y, z = inputs
+    A, x, w = A0.copy(), x0.copy(), w0.copy()
+    fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
+    correct = all(np.allclose(got, want, rtol=1e-5, atol=1e-5)
+                  for got, want in zip((A, x, w), expected))
+    times = []
+    while len(times) < (1 if single else 9) or (not single and sum(times) < min_time and len(times) < 200):
+        start = time.perf_counter()
+        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
+        times.append(time.perf_counter() - start)
+    return float(np.median(times)), correct
+
+
 # Rows kept in "blas_mt" mode (multi-threaded BLAS vs the best Numba versions)
 BLAS_MT_ROWS = (
     "3_fastmath_ij_ji_ij",
@@ -1544,73 +1583,19 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False, pw=None):
     if pw is None:
         pw = default_panel_width(vector_size)
 
-    (
-        A_initial,
-        u1,
-        v1,
-        u2,
-        v2,
-        w_initial,
-        x_initial,
-        y,
-        z,
-    ) = initialize_gemver(vector_size)
+    inputs = initialize_gemver(vector_size)
 
     # Compute the expected results outside the measured region.
-    A_expected, x_expected, w_expected = gemver_numpy_reference(
-        ALPHA,
-        BETA,
-        A_initial,
-        u1,
-        v1,
-        u2,
-        v2,
-        w_initial,
-        x_initial,
-        y,
-        z,
-    )
+    expected = gemver_numpy_reference(ALPHA, BETA, *inputs)
 
     total_flops = gemver_flop_count(vector_size)
 
-    def run_once(fn, extra=()):
-        """
-        Run fn on fresh copies of A, x, and w (GEMVER updates them in place)
-        and return the elapsed kernel time along with the result arrays.
-        extra: arguments after z (17b's start row, Baseline 19's panel width).
-        """
-        A = A_initial.copy()
-        x = x_initial.copy()
-        w = w_initial.copy()
-
-        start = time.perf_counter()
-        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
-        elapsed = time.perf_counter() - start
-
-        return elapsed, A, x, w
-
-    def measure(fn, extra=(), warmup=True, min_reps=9, min_time=0.3, max_reps=200):
-        # Warm-up call triggers Numba JIT compilation, so it is not timed.
-        if warmup:
-            run_once(fn, extra)
-
-        # Correctness check against the NumPy reference results
-        _, A, x, w = run_once(fn, extra)
-        is_correct = (
-            np.allclose(A, A_expected, rtol=1e-5, atol=1e-5)
-            and np.allclose(x, x_expected, rtol=1e-5, atol=1e-5)
-            and np.allclose(w, w_expected, rtol=1e-5, atol=1e-5)
-        )
-
-        # Array copies happen outside the timed region of each repetition.
-        # Repeat until enough time has been measured, then take the median
-        # (short N=512 runs are noisy; the median ignores outliers).
-        times = []
-        while len(times) < min_reps or (sum(times) < min_time and len(times) < max_reps):
-            times.append(run_once(fn, extra)[0])
-        elapsed = float(np.median(times))
+    def measure(fn, extra=(), single=False):
+        # - Warm timing (check_and_time_warm above): the first call compiles and is
+        #   checked against NumPy; the median of the repeated calls is reported.
+        # - extra: arguments after z (17b's start row, Baseline 19's panel width).
+        elapsed, is_correct = check_and_time_warm(fn, inputs, expected, extra, single=single)
         gflops = (total_flops / elapsed) / 1e9
-
         return gflops, elapsed, is_correct
 
     results = []
@@ -1618,7 +1603,7 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False, pw=None):
     # 0. Pure Python (GEMVER is O(N^2), so no size cap is needed for
     # moderate N, but very large N will still take a long time)
     if not blas_mt:
-        gflops, elapsed, is_correct = measure(gemver_python_0, warmup=False, min_reps=1, min_time=0.0)
+        gflops, elapsed, is_correct = measure(gemver_python_0, single=True)
         results.append(("0_python_naive", gflops, elapsed, is_correct))
 
     # Baseline functions list
@@ -1687,67 +1672,18 @@ def run_thread_sweep(vector_size=DEFAULT_N, pw=None):
     if pw is None:
         pw = default_panel_width(vector_size)
 
-    (
-        A_initial,
-        u1,
-        v1,
-        u2,
-        v2,
-        w_initial,
-        x_initial,
-        y,
-        z,
-    ) = initialize_gemver(vector_size)
-
-    A_expected, x_expected, w_expected = gemver_numpy_reference(
-        ALPHA,
-        BETA,
-        A_initial,
-        u1,
-        v1,
-        u2,
-        v2,
-        w_initial,
-        x_initial,
-        y,
-        z,
-    )
+    inputs = initialize_gemver(vector_size)
+    expected = gemver_numpy_reference(ALPHA, BETA, *inputs)
 
     total_flops = gemver_flop_count(vector_size)
     max_threads = get_num_threads()
     thread_counts = [t for t in THREAD_COUNTS if t <= max_threads]
 
-    def run_once(fn, extra=()):
-        A = A_initial.copy()
-        x = x_initial.copy()
-        w = w_initial.copy()
-
-        start = time.perf_counter()
-        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
-        elapsed = time.perf_counter() - start
-
-        return elapsed, A, x, w
-
-    def measure(fn, extra=(), min_reps=9, min_time=0.3, max_reps=200):
-        # Warm-up call: compiles on first use and starts the thread pool.
-        run_once(fn, extra)
-
-        # Repeat until enough time has been measured, then take the median,
-        # which is less sensitive to outliers than the mean for short kernels.
-        times = []
-        while len(times) < min_reps or (sum(times) < min_time and len(times) < max_reps):
-            elapsed, A, x, w = run_once(fn, extra)
-            times.append(elapsed)
-
-        is_correct = (
-            np.allclose(A, A_expected, rtol=1e-5, atol=1e-5)
-            and np.allclose(x, x_expected, rtol=1e-5, atol=1e-5)
-            and np.allclose(w, w_expected, rtol=1e-5, atol=1e-5)
-        )
-
-        elapsed = float(np.median(times))
+    def measure(fn, extra=()):
+        # - Warm timing, as in the main table (check_and_time_warm). The first
+        #   call also compiles and starts the thread pool, so it is not timed.
+        elapsed, is_correct = check_and_time_warm(fn, inputs, expected, extra)
         gflops = (total_flops / elapsed) / 1e9
-
         return gflops, elapsed, is_correct
 
     # Serial reference: the best single-threaded version
@@ -1893,9 +1829,10 @@ def save_or_show(image_path):
 #     - 11 (S1+S2 fused):             S1+S2 | S3 | S4
 #     - 17b (+ 4-row unroll-and-jam): S1+S2 | S3 | S4
 #     - 19_mk (all 4 fused, panels):  one block (its stages are interleaved)
-# - How: fresh copies of A, x, w for every run (as in run_benchmark), then the
-#   stages IN ORDER with a timestamp between them. Versions alternate every
-#   round; median of >= 9 rounds.
+# - How: the stages IN ORDER with a timestamp between them. Versions alternate
+#   every round; median of >= 9 rounds.
+# - Warm, as in the main table: each version's first run is on fresh copies and
+#   is checked against NumPy; the timed rounds reuse one set of A, x, w.
 # - Why not time each stage alone on a fresh copy: right after the copy, A is
 #   read at DRAM speed even at N=512 (23 GB/s, vs 84 GB/s once a stage has used
 #   it), so S2 alone took 3x longer than S2 right after S1.
@@ -1975,7 +1912,7 @@ def run_breakdown(n, pw=None):
     a, b = ALPHA, BETA
     A_exp, x_exp, w_exp = gemver_numpy_reference(a, b, A0, u1, v1, u2, v2, w0, x0, y, z)
 
-    # Each piece gets fresh (A, x, w) and runs one stage or one whole kernel.
+    # Each piece runs one stage or one whole kernel on (A, x, w).
     # 17b's helpers called from Python get (0, n) as run-time values -> same SIMD path as 17b.
     pieces = {
         "3:S1": lambda A, x, w: _bd_s1(A, u1, v1, u2, v2),
@@ -1996,19 +1933,17 @@ def run_breakdown(n, pw=None):
         ("3: unfused", [("S1", "3:S1", 2), ("S2", "3:S2", 1), ("S3", "S3", 0), ("S4", "3:S4", 1)], "3:whole"),
         ("11: S1+S2 fused", [("S1+S2", "11:S1+S2", 2), ("S3", "S3", 0), ("S4", "11:S4", 1)], "11:whole"),
         ("17b: + unroll-and-jam", [("S1+S2", "17b:S1+S2", 2), ("S3", "S3", 0), ("S4", "17b:S4", 1)], "17b:whole"),
-        (f"19_mk: all fused (PW={pw})", [("S1+S2+S3+S4", "19:whole", 2)], "19:whole"),
+        (f"19_mk: all fused (PW={pw})",
+         [("S1+S2+S3+S4", "19:whole", gemver_passes_over_A("19_", n, pw))], "19:whole"),
     ]
 
-    def run_chain(keys):
-        # fresh A, x, w; run the pieces in order with a timestamp between them
-        A = A0.copy()
-        x = x0.copy()
-        w = w0.copy()
+    def run_chain(keys, A, x, w):
+        # run the pieces in order on (A, x, w), with a timestamp between them
         stamps = [time.perf_counter()]
         for k in keys:
             pieces[k](A, x, w)
             stamps.append(time.perf_counter())
-        return np.diff(stamps), A, x, w
+        return np.diff(stamps)
 
     # jobs: each version's stage chain, plus its whole kernel when it is split
     jobs = []
@@ -2018,20 +1953,24 @@ def run_breakdown(n, pw=None):
             jobs.append((version, "whole", [whole]))
 
     correct = {}
-    for version, kind, keys in jobs:       # warm-up (compiles) + correctness of the chain
-        _, A, x, w = run_chain(keys)
+    for version, kind, keys in jobs:       # fresh copies: compiles + correctness of the chain
+        A, x, w = A0.copy(), x0.copy(), w0.copy()
+        run_chain(keys, A, x, w)
         if kind == "stages":
             correct[version] = (np.allclose(A, A_exp, rtol=1e-5, atol=1e-5)
                                 and np.allclose(x, x_exp, rtol=1e-5, atol=1e-5)
                                 and np.allclose(w, w_exp, rtol=1e-5, atol=1e-5))
 
+    # timed rounds: warm, one set of arrays for every run (A stays cached if it fits)
+    A, x, w = A0.copy(), x0.copy(), w0.copy()
+
     # first round also sets the number of rounds (about 8 s in total, 9 to 201)
     start = time.perf_counter()
-    times = {(v, kind): [run_chain(keys)[0]] for v, kind, keys in jobs}
+    times = {(v, kind): [run_chain(keys, A, x, w)] for v, kind, keys in jobs}
     rounds = int(min(201, max(9, 8.0 / (time.perf_counter() - start))))
     for r in range(1, rounds):
         for v, kind, keys in (jobs if r % 2 == 0 else jobs[::-1]):
-            times[(v, kind)].append(run_chain(keys)[0])
+            times[(v, kind)].append(run_chain(keys, A, x, w))
 
     results = []
     for version, stages, _ in versions:
@@ -2059,7 +1998,7 @@ def report_breakdown(n, pw=None, image_path=None, markdown=False):
     print(f"\nRunning GEMVER Per-Stage Breakdown for N={n}...")
     print(f"CPU: {CPU_NAME}")
     results, rounds, pw = run_breakdown(n, pw)
-    print(f"Median of {rounds} rounds (fresh A, x, w every run; stages timed in order). "
+    print(f"Median of {rounds} rounds (warm: same A, x, w every run; stages timed in order). "
           f"Baseline 19 panel width: {pw}\n")
 
     # rows shared by the table and the CSV
@@ -2192,15 +2131,8 @@ def plot_breakdown(results, n, rounds, path, show):
 #   "how scalable is the optimization".
 # - Kernels: 1, 2 (best order), 3, 10, 11, 12, 17, 17b, 18, 19_mk, 19_par.
 #   Baseline 0 (pure Python) only up to N=512 (about 22 s per call at N=4096).
-# - Timing is "warm": the same arrays are passed again and again, so A stays in
-#   the cache whenever it fits (the matmul benchmark times its kernels this way).
-#     - The first call runs on fresh copies and is checked against NumPy.
-#     - The timed calls repeat the same work on the updated arrays; median of >= 9.
-# - Why not a fresh copy before each call (as in the main table):
-#     - For A between 2 and 32 MB, how much of A the copy leaves in the cache
-#       depends on Windows' memory state, so the time jumps between runs
-#       (17b at N=512: 15 or 23-28 GFLOP/s; warm: 44 on every run).
-#     - Once A is larger than the L3, both ways give the same time.
+# - Timing is warm, as in the main table (check_and_time_warm): A stays in the
+#   cache whenever it fits, so each cache level shows up as its own plateau.
 # - 19 uses the default panel width at each N (L3/2 rule). Up to N=1024 that is
 #   one panel (PW = N), so S4 is not fused there (3 passes, like 17).
 # - Where A lives (A = 8 N^2 bytes; one core sees 512 KB of L2 and 32 MB of L3):
@@ -2296,24 +2228,6 @@ def free_ram_bytes():
     return None
 
 
-def check_and_time_warm(fn, inputs, expected, extra=(), single=False, min_time=0.3):
-    # - First call on fresh copies of A, x, w: compiles if needed, result checked vs NumPy.
-    # - Then the same arrays again and again ("warm"): median of >= 9 calls and >= min_time s.
-    # - single: time one call only (pure Python is too slow to repeat).
-    # - Returns (median seconds, correct).
-    A0, u1, v1, u2, v2, w0, x0, y, z = inputs
-    A, x, w = A0.copy(), x0.copy(), w0.copy()
-    fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
-    correct = all(np.allclose(got, want, rtol=1e-5, atol=1e-5)
-                  for got, want in zip((A, x, w), expected))
-    times = []
-    while len(times) < (1 if single else 9) or (not single and sum(times) < min_time and len(times) < 200):
-        start = time.perf_counter()
-        fn(ALPHA, BETA, A, u1, v1, u2, v2, w, x, y, z, *extra)
-        times.append(time.perf_counter() - start)
-    return float(np.median(times)), correct
-
-
 def run_scale(sizes):
     # Per N: NumPy check on fresh copies, then warm timing. Returns (rows, sizes that ran).
     rows, ran = [], []
@@ -2338,7 +2252,7 @@ def run_scale(sizes):
             extra = (0,) if name.startswith("17b_") else (pw,) if name.startswith("19_") else ()
             elapsed, correct = check_and_time_warm(fn, inputs, expected, extra, single=python)
             rows.append({"n": n, "name": name, "gflops": flops / elapsed / 1e9, "time_s": elapsed,
-                         "passes": gemver_passes_over_A(name), "pw": pw if name.startswith("19_") else "",
+                         "passes": gemver_passes_over_A(name, n, pw), "pw": pw if name.startswith("19_") else "",
                          "correct": correct})
             count += 1
         del inputs, expected
@@ -3059,6 +2973,283 @@ def report_asm(vector_size):
 
 
 # ---------------------------------------------------------
+# PolyBench/C Reference (optimized C baseline)
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py <N> polybench_c   (add "md" for a Markdown table)
+# - Professor (to classmates): "an optimized baseline other than BLAS", "any optimized
+#   hand-optimized?". The PolyBench/Python paper compares Python with C at -O3.
+# - polybench_c/gemver_polybench.c: PolyBench/C 4.2.1's init_array and kernel_gemver,
+#   unchanged (same data, same loops as Baseline 1), plus a small timer.
+# - Built with every C compiler found:
+#     - gcc / clang (on PATH; on Windows also inside WSL): -O3 -march=native,
+#       + -ffast-math, + PolyBench's -DPOLYBENCH_USE_RESTRICT
+#     - MSVC (Visual Studio Build Tools): /O2 /arch:AVX2 [/fp:fast]
+#     - Without fast-math a compiler may not reorder a sum (S2, S4), the same rule as
+#       Numba without fastmath. With it, it may (like fastmath=True in Baseline 3).
+# - N is fixed at compile time (-DN=...), as in PolyBench. Builds go to results/polybench_c/.
+# - Same timing as the Python rows: warm, median of >= 9 calls. The C program writes
+#   A, x, w after its first call; they are checked against NumPy here.
+# - Numba rows timed in the same run: 1 (same loops as the C code), 2_ij_ji_ij, 3, 11, 17b, 18.
+# - "SIMD stages": the stages the compiler's own report says it vectorized
+#   (and any loop nest it interchanged).
+POLYBENCH_C_SOURCE = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                  "polybench_c", "gemver_polybench.c")
+# (row name, kernel, arguments after z, flags shown in the table)
+POLYBENCH_C_NUMBA_ROWS = (
+    ("1_numba_naive", gemver_numba_1, (), "@njit"),
+    ("2_order_ij_ji_ij", gemver_2_ij_ji_ij, (), "@njit"),
+    ("3_fastmath_ij_ji_ij", gemver_opt_flags_3, (), "fastmath"),
+    ("11_fused_fastmath", gemver_fused_11, (), "fastmath"),
+    ("17b_unroll_jam_runtime_start", gemver_fused_unroll_jam_17b, (0,), "fastmath"),
+    ("18_blas", gemver_blas_18, (), "SciPy BLAS"),
+)
+# Per compiler family: ((flag-set name, flags), ...), flags that print the vectorizer report
+# - restrict: PolyBench's own -DPOLYBENCH_USE_RESTRICT ("arrays do not overlap").
+#   Without it, x[i] / w[i] might be part of A, so the sums of S2/S4 stay in memory.
+# - Report flags: one -Rpass regex (a second -Rpass flag would replace the first);
+#   gcc's "loop" group also prints the vectorizer messages.
+C_UNIX_FLAG_SETS = (("O3", ["-O3", "-march=native"]),
+                    ("O3_fastmath", ["-O3", "-march=native", "-ffast-math"]),
+                    ("O3_fastmath_restrict", ["-O3", "-march=native", "-ffast-math", "-DPOLYBENCH_USE_RESTRICT"]))
+C_FLAG_SETS = {
+    "gcc": (C_UNIX_FLAG_SETS, ["-fopt-info-loop-optimized"]),
+    "clang": (C_UNIX_FLAG_SETS, ["-Rpass=loop-vectorize|loop-interchange"]),
+    "msvc": ((("O2", ["/O2", "/arch:AVX2"]),
+              ("O2_fpfast", ["/O2", "/arch:AVX2", "/fp:fast"])),
+             ["/Qvec-report:1"]),
+}
+
+
+def run_text(cmd, timeout=1800, **kwargs):
+    # Run a command; returns (exit code, stdout + stderr). Never raises.
+    import subprocess
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                           timeout=timeout, **kwargs)
+        return r.returncode, (r.stdout or "") + (r.stderr or "")
+    except (OSError, subprocess.SubprocessError) as exc:
+        return -1, str(exc)
+
+
+def msvc_environment():
+    # - Finds Visual Studio (or its Build Tools) with vswhere, then loads the variables
+    #   vcvars64.bat sets (PATH, INCLUDE, LIB). Returns None if it is not installed.
+    installer = os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+                             "Microsoft Visual Studio", "Installer")
+    vswhere = os.path.join(installer, "vswhere.exe")
+    if not os.path.exists(vswhere):
+        return None
+    _, out = run_text([vswhere, "-latest", "-products", "*", "-requires",
+                       "Microsoft.VisualStudio.Component.VC.Tools.x86.x64", "-property", "installationPath"])
+    vcvars = os.path.join(out.strip(), "VC", "Auxiliary", "Build", "vcvars64.bat")
+    if not out.strip() or not os.path.exists(vcvars):
+        return None
+    env = dict(os.environ, PATH=installer + os.pathsep + os.environ.get("PATH", ""))
+    code, out = run_text(f'call "{vcvars}" >nul && set', shell=True, env=env)
+    if code != 0:
+        return None
+    return dict(line.split("=", 1) for line in out.splitlines() if "=" in line and not line.startswith("="))
+
+
+def find_c_compilers():
+    # - Returns (compilers, notes). Each compiler: family, label, version, cc (compile
+    #   command), run (prefix to run a binary), path (Windows path -> the tool's path), env.
+    import shutil
+    compilers, notes = [], []
+    same_path = lambda p: p
+    first_line = lambda text: text.strip().splitlines()[0] if text.strip() else "?"
+
+    for family in ("gcc", "clang"):
+        exe = shutil.which(family)
+        if exe:
+            compilers.append({"family": family, "label": family, "version": first_line(run_text([exe, "--version"])[1]),
+                              "cc": [exe], "run": [], "path": same_path, "env": None})
+
+    if sys.platform == "win32":
+        # - WSL: Linux gcc/clang on the same CPU. Paths become /mnt/<drive>/...
+        wsl = shutil.which("wsl.exe") or shutil.which("wsl")
+        if wsl:
+            folders = {}
+
+            def to_wsl(p):
+                folder, name = os.path.split(os.path.abspath(p))
+                if folder not in folders:
+                    folders[folder] = run_text([wsl, "-e", "wslpath", "-a", folder])[1].strip()
+                return folders[folder] + "/" + name
+
+            if run_text([wsl, "-e", "test", "-f", to_wsl(POLYBENCH_C_SOURCE)])[0] == 0:
+                found = False
+                for family in ("gcc", "clang"):
+                    code, out = run_text([wsl, "-e", family, "--version"])
+                    if code == 0:
+                        found = True
+                        compilers.append({"family": family, "label": f"{family} (WSL)", "version": first_line(out),
+                                          "cc": [wsl, "-e", family], "run": [wsl, "-e"], "path": to_wsl, "env": None})
+                if not found:
+                    notes.append("WSL has no gcc/clang (to add them: wsl sudo apt install gcc clang)")
+            else:
+                notes.append("WSL found, but it cannot see this folder")
+        env = msvc_environment()
+        cl = shutil.which("cl", path=env.get("PATH")) if env else None
+        if cl:
+            banner = run_text([cl], env=env)[1]      # "Microsoft (R) C/C++ Optimizing Compiler Version ..."
+            version = next((l.strip() for l in banner.splitlines() if "Version" in l), first_line(banner))
+            compilers.append({"family": "msvc", "label": "MSVC", "version": version,
+                              "cc": [cl], "run": [], "path": same_path, "env": env})
+        else:
+            notes.append("MSVC (Visual Studio Build Tools) not found")
+    if not compilers:
+        notes.append("no C compiler found: only the Numba rows are shown")
+    return compilers, notes
+
+
+def c_stage_lines():
+    # Line range of each stage in the C file: from its outer loop to its statement
+    with open(POLYBENCH_C_SOURCE, encoding="utf-8") as fh:
+        lines = fh.read().splitlines()
+    statements = {"S1": "A[i][j] = A[i][j] + u1[i]", "S2": "x[i] = x[i] + beta",
+                  "S3": "x[i] = x[i] + z[i]", "S4": "w[i] = w[i] +  alpha"}
+    ranges = {}
+    for stage, text in statements.items():
+        line = next(k for k, l in enumerate(lines, start=1) if text in l)
+        ranges[stage] = (line - (1 if stage == "S3" else 2), line)
+    return ranges
+
+
+def simd_report(log, family, ranges):
+    # Stages the compiler's report marks as vectorized loops (and interchanged nests)
+    import re
+    pattern = r"gemver_polybench\.c\((\d+)\)" if family == "msvc" else r"gemver_polybench\.c:(\d+):"
+    vectorized, interchanged = set(), set()
+    for line in log.splitlines():
+        m = re.search(pattern, line)
+        if not m:
+            continue
+        stage = next((s for s, (a, b) in ranges.items() if a <= int(m.group(1)) <= b), None)
+        low = line.lower()
+        if stage and "interchanged" in low:
+            interchanged.add(stage)
+        elif stage and ("loop vectorized" in low or "vectorized loop" in low):
+            vectorized.add(stage)
+    text = ", ".join(sorted(vectorized)) or "none"
+    return text + (f" (interchanged {', '.join(sorted(interchanged))})" if interchanged else "")
+
+
+def build_and_run_c(compiler, flag_name, flags, report_flags, n, expected, build_dir, ranges):
+    # Compile for this N, run, check A, x, w against NumPy. Returns (row or None, message).
+    wsl = bool(compiler["run"])
+    stem = f"gemver_{compiler['family']}{'_wsl' if wsl else ''}_{flag_name}_N{n}"
+    exe = os.path.abspath(os.path.join(build_dir, stem + (".exe" if sys.platform == "win32" and not wsl else "")))
+    out = os.path.abspath(os.path.join(build_dir, stem + ".bin"))
+    path = compiler["path"]
+    if compiler["family"] == "msvc":
+        cmd = compiler["cc"] + ["/nologo", "/std:c11", *flags, *report_flags, f"/DN={n}", "/wd4068",
+                                os.path.abspath(POLYBENCH_C_SOURCE), f"/Fe:{exe}"]
+        code, log = run_text(cmd, env=compiler["env"], cwd=build_dir)
+        shown = ["cl", "/std:c11", *flags, f"/DN={n}", "gemver_polybench.c"]
+    else:
+        cmd = compiler["cc"] + [*flags, *report_flags, f"-DN={n}", path(POLYBENCH_C_SOURCE), "-o", path(exe)]
+        code, log = run_text(cmd)
+        shown = [compiler["family"], *flags, f"-DN={n}", "gemver_polybench.c"]
+    if code != 0:
+        return None, f"build failed: {log.strip()[-600:]}"
+
+    code, text = run_text(compiler["run"] + [path(exe), path(out)])
+    try:
+        _, calls, median, _ = text.split()[-4:]
+        median, calls = float(median), int(calls)
+    except ValueError:
+        code = code or -1
+    if code != 0:
+        return None, f"run failed: {text.strip()[-600:]}"
+
+    data = np.fromfile(out, dtype=np.float64)
+    os.remove(out)
+    nn = n * n
+    correct = data.size == nn + 2 * n and all(
+        np.allclose(got, want, rtol=1e-5, atol=1e-5)
+        for got, want in zip((data[:nn].reshape(n, n), data[nn:nn + n], data[nn + n:]), expected))
+    row = {"name": f"C_{compiler['family']}_{flag_name}", "compiler": compiler["label"], "flags": " ".join(flags),
+           "simd": simd_report(log, compiler["family"], ranges), "time_s": median, "calls": calls,
+           "correct": correct, "command": " ".join(shown)}
+    return row, ""
+
+
+def report_polybench_c(n, markdown=False):
+    print(f"\nRunning GEMVER: PolyBench/C (compiled C) vs Numba for N={n}...")
+    print(f"CPU: {CPU_NAME}")
+    print(f"C source: benchmarks/polybench_c/gemver_polybench.c (PolyBench/C 4.2.1 kernel, unchanged)")
+    compilers, notes = find_c_compilers()
+    for c in compilers:
+        print(f"Compiler: {c['label']:<12} {c['version']}")
+    for note in notes:
+        print(f"Note: {note}")
+    print("Warm timing (same arrays called repeatedly), median of >= 9 calls; every row checked against NumPy.\n")
+
+    inputs = initialize_gemver(n)
+    expected = gemver_numpy_reference(ALPHA, BETA, *inputs)
+    flops = gemver_flop_count(n)
+
+    rows = []
+    for name, fn, extra, flags in POLYBENCH_C_NUMBA_ROWS:
+        elapsed, correct = check_and_time_warm(fn, inputs, expected, extra)
+        rows.append({"name": name, "compiler": "Numba", "flags": flags, "simd": "", "time_s": elapsed,
+                     "correct": correct, "command": ""})
+
+    build_dir = os.path.join(RESULTS_DIR, "polybench_c")
+    os.makedirs(build_dir, exist_ok=True)
+    ranges = c_stage_lines()
+    for c in compilers:
+        flag_sets, report_flags = C_FLAG_SETS[c["family"]]
+        for flag_name, flags in flag_sets:
+            row, message = build_and_run_c(c, flag_name, flags, report_flags, n, expected, build_dir, ranges)
+            if row:
+                rows.append(row)
+            else:
+                print(f"C_{c['family']}_{flag_name} ({c['label']}): {message}")
+
+    for r in rows:
+        r["gflops"] = flops / r["time_s"] / 1e9
+    t1 = next(r["time_s"] for r in rows if r["name"] == "1_numba_naive")
+    t3 = next(r["time_s"] for r in rows if r["name"] == "3_fastmath_ij_ji_ij")
+    head = ["Version", "Compiler", "Flags", "SIMD stages (compiler report)", "GFLOP/s", "Time (ms)",
+            "vs 1 (same loops)", "vs 3", "Correct"]
+    body = [[r["name"], r["compiler"], r["flags"], r["simd"] or "-", f"{r['gflops']:.2f}",
+             f"{r['time_s'] * 1e3:.3f}", f"{t1 / r['time_s']:.2f}x", f"{t3 / r['time_s']:.2f}x",
+             "PASS" if r["correct"] else "FAIL"] for r in rows]
+    table = format_table(head, body, markdown, left=4)
+    print(table)
+
+    c_rows = [r for r in rows if r["compiler"] != "Numba"]
+    if c_rows:
+        print("\nBuild commands (N is a compile-time constant, as in PolyBench):")
+        for r in c_rows:
+            print(f"  {r['name']:<20} {r['command']}")
+        best_c = min(c_rows, key=lambda r: r["time_s"])
+        best_numba = min((r for r in rows if r["compiler"] == "Numba"), key=lambda r: r["time_s"])
+        print(f"\nFastest C:     {best_c['name']} ({best_c['compiler']}): {best_c['gflops']:.2f} GFLOP/s")
+        print(f"Fastest Numba: {best_numba['name']}: {best_numba['gflops']:.2f} GFLOP/s "
+              f"(Numba / C speed: {best_c['time_s'] / best_numba['time_s']:.2f}x)")
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    stem = os.path.join(RESULTS_DIR, f"polybench_c_N{n}")
+    if markdown:
+        with open(stem + ".md", "w", encoding="utf-8") as fh:
+            fh.write(table + "\n")
+        print(f"\nMarkdown table written to {stem}.md")
+    import csv
+    with open(stem + ".csv", "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("n", "version", "compiler", "flags", "simd_stages", "gflops", "time_s",
+                         "speedup_vs_1", "speedup_vs_3", "correct", "build_command"))
+        for r in rows:
+            writer.writerow((n, r["name"], r["compiler"], r["flags"], r["simd"], f"{r['gflops']:.4f}",
+                             f"{r['time_s']:.9f}", f"{t1 / r['time_s']:.3f}", f"{t3 / r['time_s']:.3f}",
+                             "PASS" if r["correct"] else "FAIL", r["command"]))
+    print(f"CSV written to {stem}.csv")
+
+
+# ---------------------------------------------------------
 # Result Rows, Markdown Table and CSV
 # ---------------------------------------------------------
 # - One row per baseline with every column. The terminal table, the Markdown
@@ -3071,13 +3262,14 @@ RESULT_COLUMNS = ("Baseline Implementation", "GFLOP/s", "Time (ms)", "Abs Speedu
 CSV_COLUMNS = ("n", "baseline", "gflops", "time_s", "abs_speedup", "rel_speedup",
                "passes_over_A", "gbps", "pct_of_peak", "correct")
 
-def result_rows(benchmark_data, n, bw_peak):
+def result_rows(benchmark_data, n, bw_peak, pw=None):
+    # pw: Baseline 19's panel width (one panel = 3 passes, see gemver_passes_over_A)
     a_bytes = 8.0 * n * n
     ref_elapsed = benchmark_data[0][2]      # Abs Speedup: vs the first row (pure Python)
     rows = []
     prev_elapsed = None
     for name, gflops, elapsed, is_correct in benchmark_data:
-        passes = gemver_passes_over_A(name)
+        passes = gemver_passes_over_A(name, n, pw)
         gbps = passes * a_bytes / elapsed / 1e9
         rows.append({
             "name": name,
@@ -3171,10 +3363,11 @@ def write_results_csv(rows, n, path):
 #     - breakdown: time per stage instead of the baseline table.
 #     - scale: sweep N = 256 ... 8192 (an N given with it = largest size).
 #     - search: loop orders, panel width x rows, threads x panel width at N.
+#     - polybench_c: PolyBench/C compiled with gcc/clang/MSVC vs Numba (short table).
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
 # - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
-MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale", "search")
+MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale", "search", "polybench_c")
 RESULTS_DIR = "results"
 
 def parse_args(argv):
@@ -3228,6 +3421,9 @@ if __name__ == "__main__":
             print("search: --pw ignored (the panel width is one of the swept dimensions).")
         report_search(N_input, image_path, markdown="md" in modes)
         sys.exit(0)
+    if "polybench_c" in modes:
+        report_polybench_c(N_input, markdown="md" in modes)
+        sys.exit(0)
 
     # A mode word selects a sweep instead of the baseline table.
     if "threads" in modes:
@@ -3273,7 +3469,7 @@ if __name__ == "__main__":
     if BLAS_MT:
         print(f"(blas_mt: no Python row, so Abs Speedup is relative to {benchmark_data[0][0]}.)\n")
 
-    rows = result_rows(benchmark_data, N_input, bw_peak)
+    rows = result_rows(benchmark_data, N_input, bw_peak, pw)
 
     # File names: results/gemver_results_N<N>[_blas_mt][_pw<W>].csv / .md
     stem = os.path.join(RESULTS_DIR, f"gemver_results_N{N_input}"

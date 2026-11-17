@@ -321,6 +321,48 @@ Separate library calls cannot share a pass, so this is still 4 passes: 6.65 GFLO
 no faster (6.3), because memory bandwidth is the limit, not compute. The bench prints which BLAS
 is called: SciPy's OpenBLAS 0.3.31, one thread.
 
+### Optimized C baseline (PolyBench/C -O3)
+
+A second reference besides BLAS: the original PolyBench/C 4.2.1 kernel, compiled by optimizing C
+compilers (`python benchmarks/gemver_numba_bench.py 4096 polybench_c`). The file
+`benchmarks/polybench_c/gemver_polybench.c` holds PolyBench's `init_array` and `kernel_gemver` unchanged, plus a timer. `N` is a compile-time
+constant, as in PolyBench. The C rows use the same data, the same warm timing and the same NumPy
+check as the Numba rows. gcc 15.2 and clang 21.1 ran in WSL2 (a Linux virtual machine on the
+same CPU), MSVC 19.50 on Windows. "Vectorized stages" comes from each compiler's own report.
+
+| Version | Flags | Vectorized stages | GFLOP/s, `N = 512` | GFLOP/s, `N = 4096` |
+| :--- | :--- | :--- | :--- | :--- |
+| C, gcc | `-O3 -march=native` | S1, S3 | 2.59 | 1.36 |
+| C, gcc | `-O3 -march=native -ffast-math` | S1, S3 | 2.84 | 1.38 |
+| C, gcc | `-O3 -march=native -ffast-math -DPOLYBENCH_USE_RESTRICT` | S1, S2 (outer loop), S3, S4 | 12.72 | 3.54 |
+| C, clang | `-O3 -march=native` | S1, S3 | 2.52 | 1.24 |
+| C, clang | `-O3 -march=native -ffast-math` | S1, S2 (down the column), S3, S4 | 3.86 | 1.33 |
+| C, clang | `-O3 -march=native -ffast-math -DPOLYBENCH_USE_RESTRICT` | S1, S2 (down the column), S3, S4 | 3.95 | 1.32 |
+| C, MSVC | `/O2 /arch:AVX2` | S3 (S2 interchanged, scalar) | 4.91 | 4.32 |
+| C, MSVC | `/O2 /arch:AVX2 /fp:fast` | S3 (S2 interchanged, scalar) | 4.45 | 3.88 |
+| Numba 1 (same loops as the C code) | `@njit` | | 3.19 | 1.43 |
+| Numba 2_ij_ji_ij (S2 interchanged) | `@njit` | | 11.43 | 5.95 |
+| Numba 3 | `fastmath=True` | | 30.31 | 8.95 |
+| Numba 17b | `fastmath=True` | | 44.14 | 13.36 |
+| BLAS 18 | OpenBLAS, 1 thread | | 14.18 | 6.87 |
+
+- **Same loops, same speed.** gcc and clang at `-O3` run the PolyBench loops no faster than
+  Numba runs the same loops (Baseline 1): 1.2-1.4 vs 1.4 GFLOP/s at `N = 4096`. The speedups in
+  this document come from the loop transformations, not from leaving Python.
+- **No compiler fixes S2's loop order.** S2 reads `A` down its columns. gcc has
+  `-floop-interchange` on at `-O3` but does not interchange this loop nest. clang with fast-math
+  vectorizes S2 along the column, which is no faster. MSVC does interchange S2 (its assembly
+  reads `A[j][i]` along a row), which makes it the fastest C build at `N = 4096`, but it
+  vectorizes only S3.
+- **Possible aliasing blocks S2 and S4.** Their sums live in `x[i]` and `w[i]`, and C must assume
+  those could be part of `A`, so the sum is kept in memory. PolyBench's own
+  `-DPOLYBENCH_USE_RESTRICT` promises the arrays do not overlap. With it, gcc vectorizes S4 and
+  the outer loop of S2 (four columns at a time, so the loads are contiguous): 2.6x faster at
+  `N = 4096`.
+  Baselines 2 and 3 get the same effect from the loop order and fastmath.
+- **The hand-optimized versions win.** 17b is 3.1x the best C build at `N = 4096` and 3.5x at
+  `N = 512`. Even Baseline 3 is 2x ahead.
+
 ### 19- full fusion by column panels (+ micro-kernel)
 
 S4 waits for the final `x`, but **column `j` of S4 only needs `x[j]`**, and `x[j]` is final as
@@ -414,45 +456,48 @@ At `N = 512` (`A` = 2 MB, fits in the L3 cache), ![Figure 2](../gemver_numba_ben
 
 | Baseline Implementation | GFLOP/s | Time (ms) | Abs Speedup | Rel Speedup | Passes over A | GB/s | % of peak | Correct |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| 0_python_naive               |      0.007 |    352.742 |       1.00x |       1.00x |             4 |     0.0 |        0% | PASS    |
-| 1_numba_naive                |      2.869 |      0.914 |     386.00x |     386.00x |             4 |     9.2 |       25% | PASS    |
-| 2_order_ij_ij_ij             |      2.884 |      0.909 |     388.06x |       1.00x |             4 |     9.2 |       25% | PASS    |
-| 2_order_ij_ji_ij             |      7.896 |      0.332 |    1062.32x |       2.74x |             4 |    25.3 |       69% | PASS    |
-| 2_order_ji_ji_ji             |      0.951 |      2.757 |     127.92x |       0.12x |             4 |     3.0 |        8% | PASS    |
-| 2_order_ji_ij_ji             |      0.790 |      3.320 |     106.24x |       0.83x |             4 |     2.5 |        7% | PASS    |
-| 3_fastmath_ij_ji_ij          |     13.398 |      0.196 |    1802.46x |      16.96x |             4 |    42.9 |      117% | PASS    |
-| 4_parallel_rows              |      9.239 |      0.284 |    1242.92x |       0.69x |             4 |    29.6 |       81% | PASS    |
-| 4_parallel_inner             |      0.579 |      4.532 |      77.84x |       0.06x |             4 |     1.9 |        5% | PASS    |
-| 5_blocked_parallel           |      8.511 |      0.308 |    1145.08x |      14.71x |             4 |    27.2 |       74% | PASS    |
-| 6_blocked_np_dot             |      9.145 |      0.287 |    1230.35x |       1.07x |             4 |    29.3 |       80% | PASS    |
-| 7_blocked_temp_copy          |      7.764 |      0.338 |    1044.54x |       0.85x |             4 |    24.8 |       68% | PASS    |
-| 8_two_level_blocked          |      6.031 |      0.435 |     811.37x |       0.78x |             4 |    19.3 |       53% | PASS    |
-| 9_blocked_zero_alloc         |      8.885 |      0.295 |    1195.33x |       1.47x |             4 |    28.4 |       78% | PASS    |
-| 10_numpy                     |      1.624 |      1.615 |     218.43x |       0.18x |             4 |     5.2 |       14% | PASS    |
-| 11_fused_fastmath            |     15.677 |      0.167 |    2109.07x |       9.66x |             3 |    37.6 |      103% | PASS    |
-| 12_fused_parallel            |     15.275 |      0.172 |    2055.01x |       0.97x |             3 |    36.6 |      100% | PASS    |
-| 15_tiled_microkernel         |      9.268 |      0.283 |    1246.88x |       0.61x |             4 |    29.6 |       81% | PASS    |
-| 16_no_hoist                  |     15.302 |      0.171 |    2058.60x |       1.65x |             3 |    36.7 |      100% | PASS    |
-| 17_fused_unroll_jam          |     13.449 |      0.195 |    1809.40x |       0.88x |             3 |    32.3 |       88% | PASS    |
-| 17b_unroll_jam_runtime_start |     17.393 |      0.151 |    2339.91x |       1.29x |             3 |    41.7 |      114% | PASS    |
-| 17_fused_unroll_jam_par      |     13.266 |      0.198 |    1784.68x |       0.76x |             3 |    31.8 |       87% | PASS    |
-| 18_blas                      |      9.466 |      0.277 |    1273.44x |       0.71x |             4 |    30.3 |       83% | PASS    |
-| 19_fused_panel               |     15.279 |      0.172 |    2055.60x |       1.61x |             2 |    24.4 |       67% | PASS    |
-| 19_fused_panel_mk            |     17.916 |      0.146 |    2410.26x |       1.17x |             2 |    28.7 |       78% | PASS    |
-| 19_fused_panel_par           |     11.918 |      0.220 |    1603.37x |       0.67x |             2 |    19.1 |       52% | PASS    |
+| 0_python_naive               |      0.007 |    351.710 |       1.00x |       1.00x |             4 |     0.0 |        0% | PASS    |
+| 1_numba_naive                |      3.211 |      0.817 |     430.75x |     430.75x |             4 |    10.3 |       28% | PASS    |
+| 2_order_ij_ij_ij             |      3.211 |      0.817 |     430.73x |       1.00x |             4 |    10.3 |       28% | PASS    |
+| 2_order_ij_ji_ij             |     11.326 |      0.231 |    1519.27x |       3.53x |             4 |    36.2 |       98% | PASS    |
+| 2_order_ji_ji_ji             |      0.945 |      2.774 |     126.81x |       0.08x |             4 |     3.0 |        8% | PASS    |
+| 2_order_ji_ij_ji             |      0.792 |      3.312 |     106.20x |       0.84x |             4 |     2.5 |        7% | PASS    |
+| 3_fastmath_ij_ji_ij          |     29.165 |      0.090 |    3912.24x |      36.84x |             4 |    93.3 |      253% | PASS    |
+| 4_parallel_rows              |     14.722 |      0.178 |    1974.79x |       0.51x |             4 |    47.1 |      128% | PASS    |
+| 4_parallel_inner             |      0.515 |      5.091 |      69.09x |       0.04x |             4 |     1.6 |        4% | PASS    |
+| 5_blocked_parallel           |     10.763 |      0.244 |    1443.80x |      20.90x |             4 |    34.4 |       93% | PASS    |
+| 6_blocked_np_dot             |      9.684 |      0.271 |    1299.02x |       0.90x |             4 |    31.0 |       84% | PASS    |
+| 7_blocked_temp_copy          |     11.412 |      0.230 |    1530.84x |       1.18x |             4 |    36.5 |       99% | PASS    |
+| 8_two_level_blocked          |      5.159 |      0.508 |     692.07x |       0.45x |             4 |    16.5 |       45% | PASS    |
+| 9_blocked_zero_alloc         |     10.530 |      0.249 |    1412.49x |       2.04x |             4 |    33.7 |       91% | PASS    |
+| 10_numpy                     |      1.512 |      1.734 |     202.85x |       0.14x |             4 |     4.8 |       13% | PASS    |
+| 11_fused_fastmath            |     33.105 |      0.079 |    4440.78x |      21.89x |             3 |    79.4 |      215% | PASS    |
+| 12_fused_parallel            |     27.804 |      0.094 |    3729.69x |       0.84x |             3 |    66.7 |      181% | PASS    |
+| 15_tiled_microkernel         |     12.024 |      0.218 |    1612.98x |       0.43x |             4 |    38.5 |      104% | PASS    |
+| 16_no_hoist                  |     35.721 |      0.073 |    4791.69x |       2.97x |             3 |    85.7 |      232% | PASS    |
+| 17_fused_unroll_jam          |     18.297 |      0.143 |    2454.36x |       0.51x |             3 |    43.9 |      119% | PASS    |
+| 17b_unroll_jam_runtime_start |     44.896 |      0.058 |    6022.43x |       2.45x |             3 |   107.7 |      292% | PASS    |
+| 17_fused_unroll_jam_par      |     36.773 |      0.071 |    4932.82x |       0.82x |             3 |    88.2 |      239% | PASS    |
+| 18_blas                      |     11.956 |      0.219 |    1603.79x |       0.33x |             4 |    38.2 |      104% | PASS    |
+| 19_fused_panel               |     32.014 |      0.082 |    4294.39x |       2.68x |             3 |    76.8 |      208% | PASS    |
+| 19_fused_panel_mk            |     42.633 |      0.062 |    5718.86x |       1.33x |             3 |   102.3 |      277% | PASS    |
+| 19_fused_panel_par           |     32.918 |      0.080 |    4415.69x |       0.77x |             3 |    79.0 |      214% | PASS    |
 
-Columns: "Passes over A" is the model count of full reads or writes of `A`. "GB/s" is that
-count x the size of `A` / time, and "% of peak" compares it with the best measured stream
-bandwidth (`a = a + s*b`, 37.5 GB/s). When `A` fits in cache, "% of peak" can pass 100%.
+Columns: "Passes over A" is the model count of full reads or writes of `A`. Baseline 19 counts
+3 when one panel covers all of `A` (`PW = N`, the default up to `N = 1024`), because then its
+second pass is a full pass, as in 17. "GB/s" is that count x the size of `A` / time, and "% of
+peak" compares it with the best measured stream bandwidth (`a = a + s*b`, 37.5 GB/s in the
+`N = 4096` run). When `A` fits in cache, "% of peak" can pass 100%.
 
 Note. numbers are obtained from an AMD Ryzen 9 5900X: 12 cores / 24 threads, AVX2 (4 doubles
 per SIMD register), 32 KB L1d and 512 KB L2 per core, 32 MB L3 per 6-core CCD (64 MB in total),
 measured stream bandwidth 37.5 GB/s. Numba 0.67 (LLVM 22), OpenBLAS limited to one thread.
-Times are medians of at least 9 calls. Each call gets a fresh copy of `A`, so `A` starts
-outside the cache, as in PolyBench (which flushes the cache before timing). At `N = 512` the
-result of that copy depends on the state of the operating system's memory, and times can move
-by up to 2x between runs. The scalability section uses repeated calls with `A` already in
-cache, which gives steady numbers.
+Times are medians of at least 9 calls. The first call runs on fresh copies of the arrays and is
+checked against NumPy. The timed calls then repeat the kernel on the same arrays, so `A` stays
+in cache whenever it fits, as in the matmul benchmark. At `N = 4096` (`A` = 134 MB) it never
+fits, so every call reads `A` from DRAM. PolyBench instead flushes the cache before a single
+timed call. A fresh copy before every call was tried first, but at `N = 512` the result then
+depended on the state of the operating system's memory and moved by up to 2x between runs.
 
 ### Roofline
 
