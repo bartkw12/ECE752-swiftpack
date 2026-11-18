@@ -34,7 +34,10 @@ if not BLAS_MT:
     os.environ["MKL_NUM_THREADS"] = "1"
     os.environ["OMP_NUM_THREADS"] = "1"
 
+import itertools
+import random
 import time
+from collections import Counter, namedtuple
 import matplotlib
 
 # Image path (*.png) on the command line: draw off-screen with Agg (no display needed,
@@ -2494,7 +2497,7 @@ SEARCH_ROWS = (1, 2, 4, 8)
 DESIGN_SPACE = (
     ("loop order (ij/ji for S1, S2, S4)", 8),
     ("fastmath on/off", 2),
-    ("parallel loop: none/rows/inner", 3),
+    ("parallel loop: none/outer/inner", 3),
     ("threads 1 ... 24", 8),
     ("tile/panel width 32 ... N", 8),
     ("rows per step 1/2/4/8", 4),
@@ -2656,9 +2659,9 @@ def _panel_s4_rows8(alpha, A, x, w, jb, je, row_start, row_end):
     _panel_s4_rows1(alpha, A, x, w, jb, je, i, row_end)
 
 
-def _make_panel_kernel(s12, s4):
+def _make_panel_kernel(s12, s4, fastmath=True):
     # - The loop of gemver_fused_panel_mk_19, with other row helpers
-    @njit(fastmath=True)
+    @njit(fastmath=fastmath)
     def kernel(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, pw):
         n = A.shape[0]
         for jb in range(0, n, pw):
@@ -2923,6 +2926,616 @@ def plot_search(rows, pws, threads, n, roofs, refs, path, show):
              fontsize=9.5, color=muted, ha="left")
     fig.text(0.1, 0.9, f"Without panels: 3 = {refs['3']['gflops']:.1f}, 17b = {refs['17b']['gflops']:.1f} "
              f"GFLOP/s | CPU: {CPU_NAME}", fontsize=9.5, color=muted, ha="left")
+
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    fig.savefig(path, dpi=300, facecolor=surface)
+    print(f"Plot saved to {path}")
+    if show:
+        plt.show()
+
+
+# ---------------------------------------------------------
+# Random Schedule Search
+# ---------------------------------------------------------
+# Run with:  python gemver_numba_bench.py <N> random   (options: --budget 50 --seed 752 md)
+# - Professor (Nov 3): "have a test function, generate random schedules; the most
+#   naive search is to enumerate the space, select randomly and test".
+# - A schedule = one point of search mode's space (36,864 points at N=4096):
+#     fusion x loop order x fastmath x parallel loop x threads x panel width x rows per step
+# - The search:
+#     1. list every point and shuffle the list (fixed seed -> same order every run)
+#     2. take points in that order; the dependence rules below reject illegal ones
+#        (not run)
+#     3. map a legal point to its program: a program ignores the dimensions it does
+#        not use, so many points are the same program -> measured once
+#     4. build the kernel, check it against NumPy, time it (warm); keep the best
+#     5. stop after `budget` measured programs
+# - Legality (who writes what):
+#     - parallel OUTER loop: each iteration must own what it writes. S2 ji / S4 ji add
+#       into ALL of x / w in every iteration -> race. (S1 is element-wise: always fine.)
+#     - parallel INNER loop: the inner loop of S2 ij / S4 ij (and of the fused column
+#       loop) is one sum into a single x[i] / w[i] -> race.
+#     - fusing S1+S2: both must walk A the same way, S1 ij + S2 ji (by rows) or
+#       S1 ji + S2 ij (by columns). Other pairs need an interchange first.
+#     - fused by rows + parallel outer loop: threads add into the same x -> private
+#       partial x per thread (Baseline 12's fix), so it is legal.
+#     - all four fused (column panels): only S1 ij, S2 ji, S4 ij.
+# - Dimensions a program uses:
+#     - panel width: only all-four fusion (PW = N is one panel = S1+S2 fused, then S4 ij).
+#     - rows per step (unroll-and-jam): only code fused by rows, serial or outer-parallel.
+#     - threads: only with a parallel loop.
+# - Kernels are put together from our own building blocks (Baselines 2, 4, 11, 12,
+#   17, 19), not by swiftpack: swiftpack has no loop fusion yet ("Loop fusion: TODO"
+#   in doc/compiler/loop_transformations.md).
+# - Budget >= number of programs (e.g. --budget 1000): every program is timed, then
+#   the search is replayed from those timings for 1,000 seeds (nothing re-run):
+#   how good is "best of B" on a typical seed?
+# - Expect: most random points are illegal or repeats. A budget of 50 should still
+#   get close to the hand-picked best, because many programs share the choices that
+#   matter (stride-1 loop order, fusion).
+# - Observed (5900X, N=4096):
+#     - 71% of the 36,864 points are illegal; the 10,752 legal ones are 700 programs.
+#     - Budget 50 (seed 752): 253 draws, best 12.7 GFLOP/s = 0.95x 17b, 0.91x 12.
+#     - All 700 programs (9 min): the best serial one is 17b's (4 rows, one panel).
+#       Best overall: S1+S2 by rows + S4 ij, 1 row/step, 8 threads, 19.2 GFLOP/s
+#       (1.27x 17b); with threads, 1 row/step beats 4. Only 2 programs within 5%.
+#     - Replay: best of 50 = 85% of the best on the median seed; 200 programs -> 96%.
+# ---------------------------------------------------------
+RANDOM_BUDGET = 50
+RANDOM_SEED = 752
+RANDOM_REFERENCES = (     # hand-picked versions, timed in the same run
+    ("3_fastmath_ij_ji_ij", gemver_opt_flags_3, ()),
+    ("17b_unroll_jam_runtime_start", gemver_fused_unroll_jam_17b, (0,)),
+    ("12_fused_parallel", gemver_fused_parallel_12, ()),
+)
+
+# A program = a legal schedule, with the dimensions it does not use set to None.
+# kind: "unfused"; "rows" (S1+S2 fused by rows, then S4 ji); "cols" (S1+S2 fused by
+# columns); "panels" (S1+S2 by rows + S4 ij in column panels; PW = N is one panel)
+Program = namedtuple("Program", "kind o1 o2 o4 fastmath parallel threads pw rows")
+
+RACE_OUTER = "parallel outer loop, but S2 or S4 is ji: every iteration adds into all of x or w"
+RACE_INNER = "parallel inner loop, but that loop is one sum into x[i] or w[i]"
+NO_FUSION = "S1 and S2 walk A in different orders: cannot fuse without an interchange"
+NO_PANELS = "column panels need S1 ij, S2 ji, S4 ij"
+
+
+def random_space(n):
+    # The 7 dimensions of the search space, with their values at this N
+    return (("fusion", ("none", "S1+S2", "all four")),
+            ("loop order", tuple(itertools.product(("ij", "ji"), repeat=3))),
+            ("fastmath", (False, True)),
+            ("parallel loop", ("none", "outer", "inner")),
+            ("threads", tuple(t for t in THREAD_COUNTS if t <= get_num_threads())),
+            ("panel width", tuple(search_panel_widths(n))),
+            ("rows per step", SEARCH_ROWS))
+
+
+def schedule_program(point, n):
+    # One point of the space -> (Program, None) if legal, else (None, why not)
+    fusion, (o1, o2, o4), fastmath, parallel, threads, pw, rows = point
+    t = threads if parallel != "none" else None
+    if fusion == "none":
+        if parallel == "outer" and "ji" in (o2, o4):
+            return None, RACE_OUTER
+        if parallel == "inner" and "ij" in (o2, o4):
+            return None, RACE_INNER
+        return Program("unfused", o1, o2, o4, fastmath, parallel, t, None, None), None
+    if (o1, o2) not in (("ij", "ji"), ("ji", "ij")):
+        return None, NO_FUSION
+    if fusion == "all four" and (o1, o4) != ("ij", "ij"):
+        return None, NO_PANELS
+    if parallel == "outer" and o4 == "ji":
+        return None, RACE_OUTER
+    if parallel == "inner" and (o4 == "ij" or o1 == "ji"):
+        return None, RACE_INNER
+    if o1 == "ji":                                   # S1+S2 fused by columns
+        return Program("cols", o1, o2, o4, fastmath, parallel, t, None, None), None
+    if o4 == "ji":                                   # S1+S2 fused by rows, then S4 ji
+        return Program("rows", o1, o2, o4, fastmath, parallel, t, None,
+                       rows if parallel == "none" else None), None
+    return Program("panels", o1, o2, o4, fastmath, parallel, t,
+                   pw if fusion == "all four" else n, rows), None
+
+
+def fusion_group(p, n):
+    return "none" if p.kind == "unfused" else "all four" if p.kind == "panels" and p.pw < n else "S1+S2"
+
+
+def program_text(p, n):
+    # One line for the progress output
+    what = {"unfused": f"unfused {p.o1} {p.o2} {p.o4}",
+            "rows": f"S1+S2 by rows, S4 ji" + (f", {p.rows} rows/step" if p.rows else ""),
+            "cols": f"S1+S2 by columns, S4 {p.o4}",
+            "panels": (f"S1+S2 by rows, S4 ij, {p.rows} rows/step" if p.pw == n
+                       else f"all four, PW {p.pw}, {p.rows} rows/step")}[p.kind]
+    how = "serial" if p.parallel == "none" else f"{p.parallel} loop parallel, {p.threads} thr"
+    return f"{what}, fastmath {'on' if p.fastmath else 'off'}, {how}"
+
+
+# Building blocks the random search adds (the rest come from Baselines 2, 11, 12, 17, 19)
+# - Parallel stage loops for unfused code. A stage/order missing from
+#   PARALLEL_STAGE_LOOPS has no race-free version with that loop parallel.
+def _s1_ij_outer(A, u1, v1, u2, v2):
+    n = A.shape[0]
+    for i in prange(n):
+        for j in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+
+def _s1_ji_outer(A, u1, v1, u2, v2):
+    n = A.shape[0]
+    for j in prange(n):
+        for i in range(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+
+def _s1_ij_inner(A, u1, v1, u2, v2):
+    n = A.shape[0]
+    for i in range(n):
+        for j in prange(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+
+def _s1_ji_inner(A, u1, v1, u2, v2):
+    n = A.shape[0]
+    for j in range(n):
+        for i in prange(n):
+            A[i, j] = A[i, j] + u1[i] * v1[j] + u2[i] * v2[j]
+
+
+def _s2_ij_outer(beta, A, x, y):
+    n = A.shape[0]
+    for i in prange(n):                  # iteration i owns x[i]
+        for j in range(n):
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+
+def _s2_ji_inner(beta, A, x, y):
+    n = A.shape[0]
+    for j in range(n):
+        for i in prange(n):              # iteration i owns x[i]
+            x[i] = x[i] + beta * A[j, i] * y[j]
+
+
+def _s4_ij_outer(alpha, A, w, x):
+    n = A.shape[0]
+    for i in prange(n):                  # iteration i owns w[i]
+        for j in range(n):
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+
+def _s4_ji_inner(alpha, A, w, x):
+    n = A.shape[0]
+    for j in range(n):
+        for i in prange(n):              # iteration i owns w[i]
+            w[i] = w[i] + alpha * A[i, j] * x[j]
+
+
+PARALLEL_STAGE_LOOPS = {
+    "outer": {"S1": {"ij": _s1_ij_outer, "ji": _s1_ji_outer}, "S2": {"ij": _s2_ij_outer},
+              "S4": {"ij": _s4_ij_outer}},
+    "inner": {"S1": {"ij": _s1_ij_inner, "ji": _s1_ji_inner}, "S2": {"ji": _s2_ji_inner},
+              "S4": {"ji": _s4_ji_inner}},
+}
+
+
+def _fused_cols(beta, A, u1, v1, u2, v2, x, y):
+    # - S1 ji + S2 ij fused: one sweep of A by columns; column j gives x[j]
+    # - prange: column j owns A[:, j] and x[j] (a plain loop when compiled serial)
+    n = A.shape[0]
+    for j in prange(n):
+        p = v1[j]
+        q = v2[j]
+        s = 0.0
+        for i in range(n):
+            a = A[i, j] + u1[i] * p + u2[i] * q
+            A[i, j] = a
+            s += a * y[i]
+        x[j] += beta * s
+
+
+def _fused_rows_inner(beta, A, u1, v1, u2, v2, x, y):
+    # - Baseline 11's S1+S2 loop with the INNER loop parallel: column j owns A[i, j]
+    #   and x[j] (one parallel region per row)
+    n = A.shape[0]
+    for i in range(n):
+        a1 = u1[i]
+        a2 = u2[i]
+        c = beta * y[i]
+        for j in prange(n):
+            a = A[i, j] + a1 * v1[j] + a2 * v2[j]
+            A[i, j] = a
+            x[j] += c * a
+
+
+def rejit(fn, fastmath, parallel=False, **calls):
+    # - Compile fn's Python code again with other flags (as _stage_set does).
+    # - calls: helpers fn calls by name, swapped for versions with the same flags
+    #   (the 2/4/8-row helpers finish leftover rows with the 1-row ones).
+    import types
+    py = getattr(fn, "py_func", fn)
+    if calls:
+        py = types.FunctionType(py.__code__, dict(py.__globals__, **calls), py.__name__,
+                                py.__defaults__, py.__closure__)
+    return njit(fastmath=fastmath, parallel=parallel)(py)
+
+
+_BUILD_CACHE = {}
+
+
+def stage_set(fastmath, parallel):
+    # Stage loops for unfused code: Baseline 2's (serial) or the parallel ones above
+    key = ("stages", fastmath, parallel)
+    if key not in _BUILD_CACHE:
+        stages = dict(_ORDER_STAGES[fastmath])
+        if parallel != "none":
+            for s, loops in PARALLEL_STAGE_LOOPS[parallel].items():
+                stages[s] = {o: rejit(f, fastmath, parallel=True) for o, f in loops.items()}
+        _BUILD_CACHE[key] = stages
+    return _BUILD_CACHE[key]
+
+
+def row_helpers(fastmath):
+    # rows per step -> (S1+S2 helper, S4 helper) of Baseline 19, with this fastmath flag
+    key = ("rows", fastmath)
+    if key not in _BUILD_CACHE:
+        pairs = {1: (_panel_s12_rows1, _panel_s4_rows1), 2: (_panel_s12_rows2, _panel_s4_rows2),
+                 4: (_panel_s12_rows4, _panel_s4_rows4), 8: (_panel_s12_rows8, _panel_s4_rows8)}
+        if not fastmath:
+            one = (rejit(_panel_s12_rows1, False), rejit(_panel_s4_rows1, False))
+            calls = dict(_panel_s12_rows1=one[0], _panel_s4_rows1=one[1])
+            pairs = {r: one if r == 1 else (rejit(s12, False, **calls), rejit(s4, False, **calls))
+                     for r, (s12, s4) in pairs.items()}
+        _BUILD_CACHE[key] = pairs
+    return _BUILD_CACHE[key]
+
+
+def _compose_unfused(s1, s2, s3, s4, fastmath):
+    @njit(fastmath=fastmath)
+    def kernel(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+        s1(A, u1, v1, u2, v2)
+        s2(beta, A, x, y)
+        s3(x, z)
+        s4(alpha, A, w, x)
+    return kernel
+
+
+def _compose_fused(f12, s3, s4, fastmath):
+    # f12: S1+S2 in one loop nest, called as f12(beta, A, u1, v1, u2, v2, x, y)
+    @njit(fastmath=fastmath)
+    def kernel(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
+        f12(beta, A, u1, v1, u2, v2, x, y)
+        s3(x, z)
+        s4(alpha, A, w, x)
+    return kernel
+
+
+def _rows_block(s12, fastmath):
+    # A Baseline 19 S1+S2 row helper over the whole matrix, in f12's call form
+    @njit(fastmath=fastmath)
+    def f12(beta, A, u1, v1, u2, v2, x, y):
+        n = A.shape[0]
+        s12(beta, A, u1, v1, u2, v2, y, x, 0, n, 0, n)
+    return f12
+
+
+def _make_panel_par_kernel(s12, s4, rows, fastmath):
+    # - gemver_fused_panel_par_19's loop with other row helpers: threads split the
+    #   rows of each panel (chunks a multiple of `rows`), private partial x per thread
+    @njit(parallel=True, fastmath=fastmath)
+    def kernel(alpha, beta, A, u1, v1, u2, v2, w, x, y, z, pw):
+        n = A.shape[0]
+        num_chunks = get_num_threads()
+        chunk = ((n + num_chunks - 1) // num_chunks + rows - 1) // rows * rows
+        partial = np.zeros((num_chunks, pw), dtype=A.dtype)
+        for jb in range(0, n, pw):
+            je = min(jb + pw, n)
+            m = je - jb
+            for t in prange(num_chunks):
+                row_start = min(t * chunk, n)
+                row_end = min(row_start + chunk, n)
+                xp = partial[t, :m]
+                xp[:] = 0.0
+                s12(beta, A, u1, v1, u2, v2, y, xp, jb, je, row_start, row_end)
+            for j in range(m):
+                s = x[jb + j] + z[jb + j]
+                for t in range(num_chunks):
+                    s += partial[t, j]
+                x[jb + j] = s
+            for t in prange(num_chunks):
+                row_start = min(t * chunk, n)
+                row_end = min(row_start + chunk, n)
+                s4(alpha, A, x, w, jb, je, row_start, row_end)
+    return kernel
+
+
+def schedule_kernel(p):
+    # Program -> compiled kernel. Threads and PW are run-time values (set_num_threads,
+    # the pw argument), so programs that differ only in those share one kernel.
+    key = p._replace(threads=None, pw=None)
+    if key not in _BUILD_CACHE:
+        fm, par = p.fastmath, p.parallel
+        if p.kind == "panels":
+            s12, s4 = row_helpers(fm)[p.rows]
+            kernel = (_make_panel_par_kernel(s12, s4, p.rows, fm) if par == "outer"
+                      else _make_panel_kernel(s12, s4, fm))
+        else:
+            stages = stage_set(fm, par)
+            s3, s4 = stages["S3"], stages["S4"][p.o4]
+            if p.kind == "unfused":
+                kernel = _compose_unfused(stages["S1"][p.o1], stages["S2"][p.o2], s3, s4, fm)
+            else:
+                if p.kind == "cols":
+                    f12 = rejit(_fused_cols, fm, parallel=par == "outer")
+                elif par == "inner":
+                    f12 = rejit(_fused_rows_inner, fm, parallel=True)
+                else:
+                    f12 = _rows_block(row_helpers(fm)[p.rows][0], fm)
+                kernel = _compose_fused(f12, s3, s4, fm)
+        _BUILD_CACHE[key] = kernel
+    return _BUILD_CACHE[key]
+
+
+def run_random_search(n, budget, seed):
+    space = random_space(n)
+    points = list(itertools.product(*(values for _, values in space)))
+
+    # - The whole space first (no kernels run): illegal points, and how many
+    #   points each legal program stands for
+    illegal, points_per_program, program_of = Counter(), Counter(), []
+    for point in points:
+        program, why = schedule_program(point, n)
+        program_of.append(program)
+        if program is None:
+            illegal[why] += 1
+        else:
+            points_per_program[program] += 1
+
+    inputs = initialize_gemver(n)
+    expected = gemver_numpy_reference(ALPHA, BETA, *inputs)
+    flops = gemver_flop_count(n)
+    max_threads = get_num_threads()
+
+    def measure(fn, extra=(), threads=None):
+        set_num_threads(threads or max_threads)
+        elapsed, correct = check_and_time_warm(fn, inputs, expected, extra)
+        set_num_threads(max_threads)
+        return flops / elapsed / 1e9, elapsed, correct
+
+    refs = {name: measure(fn, extra) for name, fn, extra in RANDOM_REFERENCES}
+
+    # - The search: the shuffled list of points, in order
+    order = random.Random(seed).sample(range(len(points)), len(points))
+    rows, seen = [], set()
+    draws = skipped = repeats = 0
+    best = 0.0
+    for k in order:
+        if len(rows) >= budget:
+            break
+        draws += 1
+        program = program_of[k]
+        if program is None:
+            skipped += 1
+            continue
+        if program in seen:
+            repeats += 1
+            continue
+        seen.add(program)
+        start = time.perf_counter()
+        gflops, elapsed, correct = measure(schedule_kernel(program),
+                                           (program.pw,) if program.kind == "panels" else (), program.threads)
+        if correct:
+            best = max(best, gflops)
+        rows.append(dict(program=program, draw=draws, gflops=gflops, time_s=elapsed, correct=correct, best=best))
+        print(f"  {len(rows):3d}/{budget}  draw {draws:5d}  {program_text(program, n):<72} "
+              f"{gflops:7.2f} GFLOP/s  (best {best:6.2f}, {time.perf_counter() - start:4.1f} s)", flush=True)
+
+    return dict(space=space, total=len(points), illegal=illegal, points_per_program=points_per_program,
+                program_of=program_of, refs=refs, rows=rows, draws=draws, skipped=skipped, repeats=repeats)
+
+
+RANDOM_REPLAY_SEEDS = 1000
+RANDOM_REPLAY_BUDGETS = (10, 25, 50, 100, 200)
+
+
+def replay_random_search(program_of, gflops, budget, seeds):
+    # - Only after EVERY program was timed (budget >= number of programs): the best
+    #   GFLOP/s a random search with this budget finds, for many seeds, from those
+    #   timings (no kernels run). Same rules: illegal and repeated draws are free.
+    total, bests = len(program_of), []
+    for seed in range(seeds):
+        rng = random.Random(seed)
+        drawn, found, best = set(), set(), 0.0
+        while len(found) < budget and len(drawn) < total:
+            k = rng.randrange(total)
+            if k in drawn:
+                continue
+            drawn.add(k)
+            p = program_of[k]
+            if p is not None and p not in found:
+                found.add(p)
+                best = max(best, gflops.get(p, 0.0))
+        bests.append(best)
+    return np.array(bests)
+
+
+def report_random_search(n, budget=RANDOM_BUDGET, seed=RANDOM_SEED, image_path=None, markdown=False):
+    print(f"\nRunning GEMVER Random Schedule Search for N={n} "
+          f"(A = {8.0 * n * n / 1e6:.1f} MB, fits in {cache_level(n)}), budget {budget}, seed {seed}...")
+    print(f"CPU: {CPU_NAME}")
+    print("Warm timing (same arrays called repeatedly); every program checked against NumPy.\n")
+    start = time.perf_counter()
+    r = run_random_search(n, budget, seed)
+    rows, total = r["rows"], r["total"]
+    n_illegal = sum(r["illegal"].values())
+    n_programs = len(r["points_per_program"])
+    covered = sum(r["points_per_program"][row["program"]] for row in rows)
+    print(f"\nSearch took {time.perf_counter() - start:.0f} s. Numba threading layer: {threading_layer()}\n")
+
+    print(f"Search space at N={n}:")
+    for label, values in r["space"]:
+        print(f"  {label:<14} x {len(values)}")
+    print(f"  {'= points':<14}   {total:,}")
+    print(f"  illegal (dependence rules): {n_illegal:,} ({100 * n_illegal / total:.0f}%)")
+    for why, count in r["illegal"].most_common():
+        print(f"    {count:7,}  {why}")
+    print(f"  legal: {total - n_illegal:,} points = {n_programs} different programs "
+          f"(a program ignores the dimensions it does not use)\n")
+
+    print(f"Random search (seed {seed}): drew {r['draws']} points -> {r['skipped']} illegal (not run), "
+          f"{r['repeats']} repeats of a measured program, {len(rows)} measured")
+    print(f"Measured {len(rows)} of {total:,} points ({100 * len(rows) / total:.2f}%) = "
+          f"{len(rows)} of {n_programs} programs ({100 * len(rows) / n_programs:.1f}%), "
+          f"standing for {covered:,} points ({100 * covered / total:.1f}%)\n")
+
+    # - Table: measured programs, fastest first
+    ranked = sorted(rows, key=lambda row: -row["gflops"])
+    ref17 = r["refs"]["17b_unroll_jam_runtime_start"][1]
+    head = ["Rank", "Fusion", "Order (S1 S2 S4)", "PW", "Rows/step", "fastmath", "Parallel loop", "Threads",
+            "GFLOP/s", "Time (ms)", "vs 17b", "Draw", "Correct"]
+    body = []
+    for k, row in enumerate(ranked):
+        p = row["program"]
+        body.append([str(k + 1), fusion_group(p, n), f"{p.o1} {p.o2} {p.o4}",
+                     "-" if p.pw is None else "N" if p.pw == n else str(p.pw), str(p.rows or "-"),
+                     "on" if p.fastmath else "off", p.parallel, str(p.threads or "-"),
+                     f"{row['gflops']:.2f}", f"{row['time_s'] * 1e3:.3f}", f"{ref17 / row['time_s']:.2f}x",
+                     str(row["draw"]), "PASS" if row["correct"] else "FAIL"])
+    table = format_table(head, body, markdown, left=8)
+    print(f"Measured programs, fastest first (PW N = one panel):")
+    print(table)
+
+    good = [row for row in ranked if row["correct"]]
+    if good:
+        best = good[0]
+        first = next(k for k, row in enumerate(rows) if row is best) + 1
+        print(f"\nBest found:  {program_text(best['program'], n)}: {best['gflops']:.2f} GFLOP/s "
+              f"(measured program {first} of {len(rows)}, draw {best['draw']})")
+        for name, (g, _, ok) in r["refs"].items():
+            print(f"  hand-picked {name:<30} {g:6.2f} GFLOP/s -> best found = {best['gflops'] / g:.2f}x"
+                  + ("" if ok else "  (reference FAILED the check)"))
+    bad = len(rows) - len(good)
+    print(f"  {'all PASS' if not bad else f'{bad} FAIL'}")
+
+    # - Every program measured: the best in the space is known, so replay the random
+    #   search from these timings for many seeds (how good is "best of B" usually?)
+    exhaustive = len(rows) == n_programs and good
+    replay_table = ""
+    if exhaustive:
+        gflops = {row["program"]: row["gflops"] for row in good}
+        top = good[0]["gflops"]
+        print(f"\nEvery program was measured, so the best in this space is known: {top:.2f} GFLOP/s.")
+        print(f"Random search replayed from these timings, {RANDOM_REPLAY_SEEDS} seeds per budget (no kernels run):")
+        body = []
+        for b in (b for b in RANDOM_REPLAY_BUDGETS if b < n_programs):
+            bests = replay_random_search(r["program_of"], gflops, b, RANDOM_REPLAY_SEEDS)
+            body.append([str(b), f"{100 * b / n_programs:.1f}%", f"{np.median(bests):.2f} ({100 * np.median(bests) / top:.0f}%)",
+                         f"{np.percentile(bests, 10):.2f} ({100 * np.percentile(bests, 10) / top:.0f}%)",
+                         f"{100 * np.mean(bests >= 0.95 * top):.0f}%"])
+        replay_table = format_table(["Budget (programs)", "Share of programs", "Median best GFLOP/s",
+                                     "Unlucky seeds (10th percentile)", "Seeds within 5% of the best"],
+                                    body, markdown)
+        print(replay_table)
+
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    suffix = ("_all" if exhaustive else "" if budget == RANDOM_BUDGET else f"_budget{budget}") + \
+             ("" if seed == RANDOM_SEED else f"_seed{seed}")
+    stem = os.path.join(RESULTS_DIR, f"random_search_N{n}{suffix}")
+    if markdown:
+        with open(stem + ".md", "w", encoding="utf-8") as fh:
+            fh.write(table + "\n" + (f"\nReplayed random search:\n\n{replay_table}\n" if replay_table else ""))
+        print(f"\nMarkdown table written to {stem}.md")
+    import csv
+    with open(stem + ".csv", "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("n", "seed", "measured", "draw", "kind", "fusion", "s1_order", "s2_order", "s4_order",
+                         "panel_width", "rows_per_step", "fastmath", "parallel", "threads", "gflops", "time_s",
+                         "best_so_far", "points_in_space", "correct"))
+        for k, row in enumerate(rows):
+            p = row["program"]
+            writer.writerow((n, seed, k + 1, row["draw"], p.kind, fusion_group(p, n), p.o1, p.o2, p.o4,
+                             p.pw or "", p.rows or "", p.fastmath, p.parallel, p.threads or "",
+                             f"{row['gflops']:.4f}", f"{row['time_s']:.9f}", f"{row['best']:.4f}",
+                             r["points_per_program"][p], "PASS" if row["correct"] else "FAIL"))
+    print(f"CSV written to {stem}.csv")
+
+    plot_random_search(r, n, seed, image_path or stem + ".png", show=image_path is None)
+
+
+# One fixed color + marker per fusion group (identity is never color alone)
+RANDOM_GROUP_STYLE = {
+    "none": ("#2a78d6", "o", "no fusion"),
+    "S1+S2": ("#eb6834", "s", "S1+S2 fused"),
+    "all four": ("#6250d6", "D", "all four fused (panels)"),
+}
+
+
+def plot_random_search(r, n, seed, path, show):
+    # Each measured program as a dot (in the order drawn), the best-so-far as a step
+    # line, and the hand-picked versions as dashed reference lines.
+    from matplotlib.ticker import NullLocator
+    from matplotlib.transforms import blended_transform_factory
+    surface, ink, ink2, muted = "#fcfcfb", "#0b0b0b", "#52514e", "#898781"
+    grid, axis_color = "#e1e0d9", "#c3c2b7"
+    rows = r["rows"]
+    if not rows:
+        return
+
+    fig, ax = plt.subplots(figsize=(12, 6.5), facecolor=surface)
+    fig.subplots_adjust(left=0.075, right=0.79, top=0.8, bottom=0.12)
+    ax.set_facecolor(surface)
+    size = 64 if len(rows) <= 100 else 24            # smaller dots when every program is shown
+    for group, (color, marker, label) in RANDOM_GROUP_STYLE.items():
+        pts = [(k + 1, row["gflops"]) for k, row in enumerate(rows) if fusion_group(row["program"], n) == group]
+        if pts:
+            ax.scatter(*zip(*pts), s=size, color=color, marker=marker, edgecolors=surface, linewidths=0.8,
+                       label=label, zorder=3)
+    xs = list(range(1, len(rows) + 1))
+    ax.step(xs, [row["best"] for row in rows], where="post", color=ink, linewidth=2, label="best so far", zorder=4)
+
+    # - Hand-picked references: dashed lines, labels in the right margin (pushed apart if close)
+    refs = sorted(((r["refs"][name][0], label) for name, label in (
+        ("3_fastmath_ij_ji_ij", "3: unfused + fastmath"),
+        ("17b_unroll_jam_runtime_start", "17b: best serial (hand-picked)"),
+        ("12_fused_parallel", "12: fused + parallel"))), key=lambda ref: ref[0])
+    to_margin = blended_transform_factory(ax.transAxes, ax.transData)
+    label_y = 0.0
+    for g, label in refs:
+        ax.axhline(g, color=ink2, linestyle=(0, (5, 3)), linewidth=1.1, zorder=2)
+        label_y = max(g, label_y * 1.12)
+        ax.text(1.012, label_y, f"{label}  {g:.1f}", transform=to_margin, ha="left", va="center",
+                fontsize=8.5, color=ink2)
+
+    values = [row["gflops"] for row in rows] + [g for g, _ in refs]
+    ax.set_yscale("log")
+    ax.set_ylim(min(values) / 1.4, max(values) * 1.6)
+    ticks = [t for t in (0.1, 0.2, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500)
+             if min(values) / 1.4 <= t <= max(values) * 1.6]
+    ax.set_yticks(ticks)
+    ax.set_yticklabels([f"{t:g}" for t in ticks])
+    ax.yaxis.set_minor_locator(NullLocator())
+    ax.set_xlim(0.3, len(rows) + 0.7)
+    ax.tick_params(axis="x", colors=ink2, length=0, pad=6)
+    ax.tick_params(axis="y", colors=muted, length=0)
+    ax.yaxis.grid(True, color=grid, linewidth=0.8)
+    ax.set_axisbelow(True)
+    for side in ("top", "right", "left"):
+        ax.spines[side].set_visible(False)
+    ax.spines["bottom"].set_color(axis_color)
+    ax.set_xlabel("Measured program (in the order the random search drew them)", color=ink2)
+    ax.set_ylabel("GFLOP/s (log scale, higher is better)", color=ink2)
+    ax.legend(loc="lower left", bbox_to_anchor=(0, 1.02), ncol=4, frameon=False, fontsize=9,
+              labelcolor=ink2, handlelength=2.2, columnspacing=1.6)
+
+    n_illegal = sum(r["illegal"].values())
+    fig.text(0.075, 0.955, f"Random schedule search: {len(rows)} programs from a space of "
+             f"{r['total']:,} points (N={n}, seed {seed})", fontsize=13, color=ink, ha="left")
+    fig.text(0.075, 0.918, f"{r['draws']:,} random draws: {r['skipped']:,} illegal (skipped), {r['repeats']:,} repeats, "
+             f"{len(rows)} measured. Whole space: {100 * n_illegal / r['total']:.0f}% illegal, "
+             f"{len(r['points_per_program'])} different programs.", fontsize=9, color=muted, ha="left")
+    fig.text(0.075, 0.89, f"Warm timing, median of >= 9 calls; every program checked against NumPy | CPU: {CPU_NAME}",
+             fontsize=9, color=muted, ha="left")
 
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
     fig.savefig(path, dpi=300, facecolor=surface)
@@ -3363,11 +3976,14 @@ def write_results_csv(rows, n, path):
 #     - breakdown: time per stage instead of the baseline table.
 #     - scale: sweep N = 256 ... 8192 (an N given with it = largest size).
 #     - search: loop orders, panel width x rows, threads x panel width at N.
+#     - random: random schedule search (--budget programs, --seed for the order).
 #     - polybench_c: PolyBench/C compiled with gcc/clang/MSVC vs Numba (short table).
 # - image.png: save the plot there instead of opening a window
 #   (upstream run_bench.sh: "512 doc/gemver_numba_bench_512.png").
 # - --pw W: panel width for Baseline 19 (default: default_panel_width(N)).
-MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale", "search", "polybench_c")
+# - --budget B, --seed S: random mode (default 50 programs, seed 752).
+MODES = ("threads", "asm", "blas_mt", "md", "breakdown", "scale", "search", "random", "polybench_c")
+OPTIONS = {"--pw": "pw", "--budget": "budget", "--seed": "seed"}     # flag -> key; value None = default
 RESULTS_DIR = "results"
 
 def parse_args(argv):
@@ -3375,16 +3991,17 @@ def parse_args(argv):
     n_given = False         # scale mode: an N on the command line caps the sizes
     modes = set()
     image_path = None
-    pw = None
+    options = dict.fromkeys(OPTIONS.values())
     args = list(argv)
     while args:
         arg = args.pop(0)
-        if arg == "--pw" or arg.startswith("--pw="):
+        flag = arg.split("=", 1)[0]
+        if flag in OPTIONS:
             value = arg.split("=", 1)[1] if "=" in arg else (args.pop(0) if args else "")
-            if value.isdigit() and int(value) > 0:
-                pw = int(value)
+            if value.isdigit() and (int(value) > 0 or flag == "--seed"):
+                options[OPTIONS[flag]] = int(value)
             else:
-                print(f"Ignoring --pw '{value}': expected a positive integer.")
+                print(f"Ignoring {flag} '{value}': expected a positive integer.")
         elif arg.lower().endswith(".png"):
             image_path = arg
         elif arg in MODES:
@@ -3401,11 +4018,12 @@ def parse_args(argv):
                 n_given = True
             else:
                 print(f"Invalid vector size. Using the default N={DEFAULT_N}.")
-    return n, modes, image_path, pw, n_given
+    return n, modes, image_path, options, n_given
 
 
 if __name__ == "__main__":
-    N_input, modes, image_path, pw_input, n_given = parse_args(sys.argv[1:])
+    N_input, modes, image_path, options, n_given = parse_args(sys.argv[1:])
+    pw_input = options["pw"]
     pw = pw_input if pw_input is not None else default_panel_width(N_input)
 
     # scale: every size in SCALE_SIZES (or up to the N given); CSV/PNG in results/
@@ -3420,6 +4038,13 @@ if __name__ == "__main__":
         if pw_input is not None:
             print("search: --pw ignored (the panel width is one of the swept dimensions).")
         report_search(N_input, image_path, markdown="md" in modes)
+        sys.exit(0)
+    if "random" in modes:
+        if pw_input is not None:
+            print("random: --pw ignored (the panel width is one of the sampled dimensions).")
+        report_random_search(N_input, options["budget"] or RANDOM_BUDGET,
+                             RANDOM_SEED if options["seed"] is None else options["seed"],
+                             image_path, markdown="md" in modes)
         sys.exit(0)
     if "polybench_c" in modes:
         report_polybench_c(N_input, markdown="md" in modes)

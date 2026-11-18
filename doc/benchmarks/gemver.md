@@ -538,7 +538,7 @@ The choices behind these versions form a search space:
 
 1. **Loop order:** `ij` or `ji` for S1, S2 and S4: 8 combinations.
 2. **Backend flags:** fastmath on or off: 2.
-3. **Parallel loop:** none, the rows, or the inner loop: 3.
+3. **Parallel loop:** none, the outer loop, or the inner loop: 3.
 4. **Threads:** 1, 2, 4, 6, 8, 12, 16, 24: 8.
 5. **Tile / panel width:** 32 ... 2048 and `N`: 8.
 6. **Unroll (rows per step):** 1, 2, 4, 8: 4.
@@ -561,3 +561,78 @@ panel width x rows per step, and 19_par's panel width x threads.
 
 `swiftpack` has no loop-fusion transformation yet, so this search runs over hand-written
 kernels rather than over code that `swiftpack` generates.
+
+### Random schedule search
+
+The search above fixes all dimensions but one or two. The simplest automatic search is to list
+every point of the space, pick points at random, and test each one
+(`python benchmarks/gemver_numba_bench.py 4096 random`, with `--budget 50` and `--seed 752` as
+defaults):
+
+1. The points are shuffled with a fixed seed, so a run can be repeated.
+2. Each point is checked for legality before anything runs.
+3. A legal point is mapped to its program. A program ignores the dimensions it does not use
+   (threads without a parallel loop, panel width without full fusion, rows per step without
+   fusion by rows), so many points are the same program. Each program is measured once.
+4. The kernel is put together from the building blocks of Baselines 2, 4, 11, 12, 17 and 19,
+   checked against NumPy, and timed.
+
+The legality rules follow from who writes what:
+
+- **Parallel outer loop:** every iteration must own what it writes. In S2 `ji` and S4 `ji`,
+  every iteration adds into all of `x` or `w`, which is a race. S1 is element-wise, so any of its
+  loops can be parallel. When S1+S2 are fused by rows, each thread gets a private partial `x`
+  (Baseline 12's fix).
+- **Parallel inner loop:** in S2 `ij` and S4 `ij`, the inner loop is one sum into a single
+  `x[i]` or `w[i]`, which is a race.
+- **Fusion:** S1 and S2 can only be fused if they walk `A` the same way: S1 `ij` with S2 `ji` (by
+  rows) or S1 `ji` with S2 `ij` (by columns). Column panels need `ij ji ij`.
+
+| Points at `N = 4096` | Count | Share |
+| :--- | :--- | :--- |
+| All points | 36,864 | 100% |
+| Illegal: S1 and S2 walk `A` in different orders (cannot fuse) | 12,288 | 33% |
+| Illegal: parallel inner loop that is one sum | 5,120 | 14% |
+| Illegal: column panels without `ij ji ij` | 4,608 | 13% |
+| Illegal: parallel outer loop of S2/S4 `ji` (race) | 4,096 | 11% |
+| Legal | 10,752 = 700 different programs | 29% |
+
+![Random schedule search](../gemver_random_search_4096.png)
+
+With a budget of 50, the search drew 253 points: 180 were illegal, 23 repeated a program it had
+already measured, and 50 were measured (0.14% of the points, 7% of the programs). The best was
+S1+S2 fused by rows, S4 `ij`, 2 rows per step, 24 threads: 12.7 GFLOP/s, which is 0.95x of 17b
+and 0.91x of Baseline 12 in the same run. It came up as the 16th measured program.
+
+There are only 700 programs, so all of them can be timed (`--budget 1000`, 9 minutes). Then the
+best program in the space is known, and the random search can be replayed from those timings
+for 1,000 seeds without running anything. The table gives the best GFLOP/s found, as a share of
+the best program (19.2 GFLOP/s):
+
+| Budget (programs) | Share of programs | Median seed | Unlucky seeds (10th percentile) | Seeds within 5% of the best |
+| :--- | :--- | :--- | :--- | :--- |
+| 10 | 1.4% | 70% | 41% | 3% |
+| 25 | 3.6% | 80% | 69% | 6% |
+| 50 | 7.1% | 85% | 77% | 12% |
+| 100 | 14.3% | 92% | 84% | 29% |
+| 200 | 28.6% | 96% | 93% | 69% |
+
+- **17b is the best serial program in the space.** The fastest serial program is S1+S2 fused by
+  rows, 4 rows per step, fastmath, one panel. That is 17b (15.3 vs 15.2 GFLOP/s in the same run).
+- **The best program overall is parallel, and not one we picked by hand:** the same fused loop
+  with 1 row per step and 8 threads, 19.2 GFLOP/s (1.27x 17b, 1.2x Baseline 12 at its default 24
+  threads). With threads, 1 row per step beats 4 (15.6-19.2 vs 11.7-16.3 GFLOP/s from 2 threads
+  up). The coordinate search above could not see this, because it kept 19_par at 4 rows per step.
+  Neighbouring parallel results differ by about 15%, so the exact peak is partly luck. It is
+  above the 3-pass DRAM roof (15.6), so part of `A` likely stays in cache: with threads on both
+  CCDs, 64 MB of L3 can keep part of each thread's rows between its S1+S2 pass and its S4 pass.
+- **Good programs are rare.** Only 2 of the 700 programs are within 5% of the best, and 36 within
+  20%. So the best of 50 is usually 85% of the best, and only 12% of seeds get within 5%. It
+  takes about 200 programs (29% of all programs) to get within 5% on most seeds.
+- **Most of the space is illegal or repeated.** 71% of the points break a dependence, and the
+  10,752 legal points are only 700 programs. The legality check and the mapping to programs make
+  the search cheap. The NumPy check alone is not enough to reject an illegal point: a race can
+  still give the right answer on a given run.
+
+Like the coordinate search, this runs over our own building blocks, because `swiftpack` cannot
+fuse loops yet.
