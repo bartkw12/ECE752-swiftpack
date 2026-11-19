@@ -1659,14 +1659,17 @@ def run_benchmark(vector_size=DEFAULT_N, blas_mt=False, pw=None):
 # - Compares each one with the best serial version (11_fused_fastmath).
 # - Expectation: GEMVER is memory-bound, so threads help only until memory
 #   bandwidth is used up. Curves should flatten after a few threads at N=4096.
-# - Observed (5900X), N=4096:
-#     - 12_fused_parallel peaks at 2-4 threads (~1.25x over its own 1 thread,
-#       ~1.4x over serial 11), then drops back to ~1.0x at 24 threads.
-#       Once memory is saturated, more threads only add contention.
-#     - 4_parallel_rows scales best (~4.8x) only because its 1-thread run is
-#       slow (strided stage 2 waits on cache misses). It never reaches serial 11.
-#       Good scaling is not the same as good performance.
-#     - 5_blocked_parallel flattens at ~2x by 6 threads.
+# - Observed (5900X), N=4096, idle machine (2026-11-18):
+#     - 12_fused_parallel peaks at 8 threads: 22.0 GFLOP/s, 1.8x over its own
+#       1 thread, 2.0x over serial 11. More threads are slower again (16.1 at 24):
+#       once memory is saturated, more threads only add contention.
+#     - 4_parallel_rows scales best (5.4x at 24 threads) only because its 1-thread
+#       run is slow (strided stage 2 waits on cache misses). It never reaches
+#       serial 11 (8.0 vs 11.1). Good scaling is not the same as good performance.
+#     - 5_blocked_parallel flattens after 2 threads (6-7.5 GFLOP/s); 17_par and
+#       19_par are flat from 1 thread (13.6-16.2 and 11.3-13.8).
+#     - Earlier runs with other apps open: 12 peaked at 2-4 threads instead. The
+#       apps take memory bandwidth, and the threaded versions need it most.
 # - Observed (5900X), N=1024 (A = 8 MB, fits in L3): under 1 ms per run and
 #   too noisy (1.2x and 2.7x for the same setting), so no conclusion drawn.
 THREAD_COUNTS = [1, 2, 4, 6, 8, 12, 16, 24]
@@ -1765,6 +1768,25 @@ def report_thread_sweep(vector_size, pw=None, image_path=None):
             )
         print(divider)
 
+    # - CSV like the other modes: results/threads_N<N>[_pw<W>].csv
+    #   (threads = "-" for the serial reference row)
+    import csv
+    csv_path = os.path.join(RESULTS_DIR, f"threads_N{vector_size}{f'_pw{pw}' if pw else ''}.csv")
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+    with open(csv_path, "w", encoding="utf-8", newline="") as fh:
+        writer = csv.writer(fh)
+        writer.writerow(("n", "baseline", "threads", "gflops", "time_s", "speedup_vs_1_thread",
+                         "speedup_vs_serial_11", "correct"))
+        writer.writerow((vector_size, "11_fused_fastmath (serial)", "-", f"{serial_gflops:.4f}",
+                         f"{serial_elapsed:.9f}", "", "1.000",
+                         "PASS" if serial_correct else "FAIL"))
+        for name, rows in results:
+            for t, gflops, elapsed, is_correct in rows:
+                writer.writerow((vector_size, name, t, f"{gflops:.4f}", f"{elapsed:.9f}",
+                                 f"{rows[0][2] / elapsed:.3f}", f"{serial_elapsed / elapsed:.3f}",
+                                 "PASS" if is_correct else "FAIL"))
+    print(f"CSV written to {csv_path}")
+
     # Plotting Output: throughput (left) and self-relative speedup (right)
     colors = ["#2a78d6", "#eb6834", "#1baf7a", "#8e5cd9", "#d6336c"]
     markers = ["o", "s", "^", "D", "v"]
@@ -1845,12 +1867,12 @@ def save_or_show(image_path):
 #     - S1 reads + writes A (2 passes) ~ 50%; S2 and S4 read A once ~ 25% each;
 #       S3 touches only vectors ~ 0%.
 #     - Fusing S1+S2 removes S2's pass; the panels also remove S4's (ideal case).
-# - Observed (5900X):
-#     - N=4096: S1 48%, S2 27%, S4 25%, S3 0% -> time follows passes (2:1:1).
-#       Fused S1+S2 (9.7 ms in 17b) costs about what S1 alone did (10.6 ms):
-#       S2's pass is gone. S4 stays ~5.4 ms (its own pass) until panels.
-#     - N=512: S1 63% (first pass after the copy, A from DRAM); S2 and S4 then
-#       read A from cache at 80-95 GB/s, so fusion saves less at this size.
+# - Observed (5900X, 2026-11-18, warm timing):
+#     - N=4096: S1 45%, S2 29%, S4 26%, S3 0% -> time follows passes (2:1:1).
+#       Fused S1+S2 (7.1 ms in 17b) costs a little less than S1 alone (7.7 ms):
+#       S2's pass is gone. S4 stays 3.8-4.8 ms (its own pass) until panels.
+#     - N=512 (A in L3): the same 2:1:1 split (S1 44%, S2 30%, S4 25%) at
+#       80-110 GB/s; 17b's S1+S2 costs the same as S1 alone (39 us).
 # - Output: table, results/breakdown_N<N>.csv, stacked bar PNG
 #   (results/breakdown_N<N>.png, or the .png path given on the command line).
 # ---------------------------------------------------------
@@ -2146,17 +2168,17 @@ def plot_breakdown(results, n, rounds, path, show):
 # - Expect: fastest while A is in cache, a drop once A leaves the L3 (N > 2048),
 #   then flat lines under the DRAM roofs. Fused versions (3 passes) keep their
 #   lead over the unfused ones (4 passes) after the drop.
-# - Observed (5900X, roofs at 37.7 GB/s):
-#     - Serial, A in cache (N <= 1536): 17b and 19_mk 37-46 GFLOP/s, 3 about 30.
-#     - N=2048 (A = 33.6 MB, just over the L3): serial speed halves (17b 45 -> 22).
-#     - DRAM: 17b 12-14.5 GFLOP/s (86% of the 3-pass roof at N=4096);
-#       3 about 9 (77% of the 4-pass roof).
-#     - Parallel 12 / 19_par: 74-159 GFLOP/s while A fits in both CCDs' L3
-#       (N <= 2048), 11-14 in DRAM. Threads pay off in cache, hardly in DRAM.
-#     - Fusion keeps its lead after the drop: 17b 1.35-1.6x over 3 for N >= 3072
-#       (11: 1.15-1.3x). BLAS (18) stays at about 0.7x of 3.
+# - Observed (5900X, roofs at 38.6 GB/s; idle machine, 2026-11-18):
+#     - Serial, A in cache (N <= 1536): 17b 34-44 GFLOP/s, 19_mk 33-45, 3 28-30.
+#     - N=2048 (A = 33.6 MB, just over one L3): 3 drops to 17, 17b to 34.
+#     - DRAM (N >= 3072): 17b 12-18 GFLOP/s (95% of the 3-pass roof at N=4096);
+#       3 8-10 (70% of the 4-pass roof at N=4096).
+#     - Parallel 12 / 19_par: 122-144 GFLOP/s at N=1536-2048 (A fits in both
+#       CCDs' L3), 11-18 from N=4096 on. Threads pay off in cache, much less in DRAM.
+#     - Fusion keeps its lead after the drop: 17b 1.3-1.8x over 3 for N >= 3072
+#       (11: 1.1-1.3x). BLAS (18) stays at 0.7-0.85x of 3.
 #     - 19_mk falls behind as N grows: PW shrinks to 256 at N >= 6144 (short rows).
-#     - 17 vs 17b: 2.6x slower in cache (N=1024), only 1.1x in DRAM.
+#     - 17 vs 17b: 2.6x slower in cache (N=1024), 1.0-1.3x in DRAM.
 # - Output: tables (GFLOP/s, speedup vs 3), results/scale.csv, results/scale.png.
 # ---------------------------------------------------------
 SCALE_SIZES = (256, 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192)
@@ -2480,17 +2502,16 @@ def plot_scale(by_name, sizes, bw_peak, path, show):
 #     2. Wider panels are faster (longer row pieces) until PW = N (one panel, so
 #        S4 is not fused). 4 rows beat 1; 8 rows may not fit in 16 vector registers.
 #     3. Best at a few threads: GEMVER is memory-bound (as in the thread sweep).
-# - Observed (5900X, N=4096; other programs were running, so cells move by ~15%):
-#     1. Only the order with ALL stages stride-1 (ij ji ij) is fast: 7.8 GFLOP/s,
-#        the next one 1.6. One strided stage alone costs ~100 ms (column walk over
-#        134 MB), so no single stage "dominates": S1 2.5x, S2 2.1x, S4 2.0x
-#        (geometric mean). fastmath: 1.24x on ij ji ij, ~1.0x on the strided ones.
-#     2. Wider panels are faster for every row count (PW <= 256: 6-10 GFLOP/s,
-#        PW >= 2048: 10-13). 1 row is slowest; 2, 4, 8 rows are close.
-#        One panel (PW = N, 3 passes) is as fast as PW = 2048: the shorter
-#        row pieces cost what the saved pass gains. Best 13.3 ~ 17b (13.4).
-#     3. 19_par: 1-4 threads with wide panels are best (~14 GFLOP/s);
-#        12-24 threads give ~10.5 for every panel width.
+# - Observed (5900X, N=4096, idle machine 2026-11-18; cells still move by ~15%):
+#     1. Only the order with ALL stages stride-1 (ij ji ij) is fast: 9.9 GFLOP/s,
+#        the next one 1.6. One strided stage alone costs ~90-120 ms (column walk
+#        over 134 MB), so no single stage "dominates": S1 2.6x, S2 2.2x, S4 2.1x
+#        (geometric mean). fastmath: 1.56x on ij ji ij, ~1.0x on the strided ones.
+#     2. Wider panels are mostly faster (PW <= 256: 7-10 GFLOP/s, PW >= 2048:
+#        11-15). 1 row is slowest. One panel (PW = N, 3 passes) is the best cell:
+#        the shorter row pieces cost more than the saved pass gains. Best 15.3 = 17b.
+#     3. 19_par: one panel is best too (14.8 GFLOP/s on average over thread
+#        counts, best 16.7 at 8 threads); narrower panels average 12-13.5.
 # - Output: tables, results/search_N<N>.csv, results/search_heatmap_N<N>.png.
 # ---------------------------------------------------------
 SEARCH_ROWS = (1, 2, 4, 8)
@@ -2975,11 +2996,13 @@ def plot_search(rows, pws, threads, n, roofs, refs, path, show):
 #   matter (stride-1 loop order, fusion).
 # - Observed (5900X, N=4096):
 #     - 71% of the 36,864 points are illegal; the 10,752 legal ones are 700 programs.
-#     - Budget 50 (seed 752): 253 draws, best 12.7 GFLOP/s = 0.95x 17b, 0.91x 12.
+#     - Budget 50 (seed 752): 253 draws, best 16.0 GFLOP/s = 1.05x 17b, 0.89x 12.
 #     - All 700 programs (9 min): the best serial one is 17b's (4 rows, one panel).
-#       Best overall: S1+S2 by rows + S4 ij, 1 row/step, 8 threads, 19.2 GFLOP/s
-#       (1.27x 17b); with threads, 1 row/step beats 4. Only 2 programs within 5%.
-#     - Replay: best of 50 = 85% of the best on the median seed; 200 programs -> 96%.
+#       Best overall: Baseline 12's loop (S1+S2 by rows, 1 row/step, private x)
+#       with 8 threads instead of 24: 19.7 GFLOP/s (1.28x 17b, 1.16x 12 at 24).
+#       From 4 threads up, 1 row/step beats 4. Only 3 programs within 5%.
+#     - Replay: best of 50 = 88% of the best on the median seed; 200 programs -> 96%.
+#     - (Idle-machine run, 2026-11-18.)
 # ---------------------------------------------------------
 RANDOM_BUDGET = 50
 RANDOM_SEED = 752
@@ -4052,7 +4075,7 @@ if __name__ == "__main__":
 
     # A mode word selects a sweep instead of the baseline table.
     if "threads" in modes:
-        report_thread_sweep(N_input, pw, image_path)
+        report_thread_sweep(N_input, pw_input, image_path)
         sys.exit(0)
     if "asm" in modes:
         report_asm(N_input)
