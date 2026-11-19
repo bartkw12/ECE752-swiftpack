@@ -513,7 +513,7 @@ def gemver_blocked_np_dot_6(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # Baseline 7: Blocked Temporary Copies
 # - Copies A tiles and x/w segments into contiguous temporary arrays.
 # - Updates each temporary, then writes the result back.
-# - Result: 0.311 ms at N=512; slightly slower than Baseline 6 at N=4096.
+# - Result: 0.246 ms at N=512; slightly slower than Baseline 6 at N=4096 (21.1 vs 20.5 ms).
 # - Extra copies add memory traffic, while GEMVER does not reuse each tile enough to recover the cost.
 # ---------------------------------------------------------
 @njit(parallel=True, fastmath=True)
@@ -570,7 +570,7 @@ def gemver_blocked_temp_copy_7(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # ---------------------------------------------------------
 # Baseline 8: Two-Level Blocking
 # - Uses 128-wide outer blocks and 32-wide inner blocks for L2/L1 locality. Direct port from matmul.
-# - Result: 0.515 ms at N=512, the slowest blocked version.
+# - Result: 0.451 ms at N=512, the slowest blocked version (20.1 ms at N=4096, same as the others).
 # - Only four outer blocks exist at N=512, so most of the 24 threads receive no work.
 # - Multi-level cache blocking helps only when data is reused; GEMVER mostly streams A.
 # ---------------------------------------------------------
@@ -644,7 +644,7 @@ def gemver_two_level_blocked_8(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # - Removes np.outer, np.dot, and per-tile temporary arrays from blocked loops.
         # zero repeated per-tile allocation of large temporary arrays (inside main tile processing loops).
 # - Uses one small accumulator per block/thread and plain compiled loops.
-# - Result: 0.261 ms at N=512; close to the other blocked variants at N=4096.
+# - Result: 0.198 ms at N=512; close to the other blocked variants at N=4096 (20.6 ms).
 # - Conclusion: allocation was not the main bottleneck; matrix traffic remained unchanged.
 # ---------------------------------------------------------
 @njit(parallel=True, fastmath=True)
@@ -712,7 +712,7 @@ def gemver_blocked_zero_alloc_9(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # Baseline 10: NumPy Reference
 # - Expresses GEMVER with np.outer and np.dot; external BLAS is forced to one thread.
 # - Provides a concise reference implementation and expected output.
-# - Result: 1.75 ms at N=512; 115 ms at N=4096.
+# - Result: 1.18 ms at N=512; 121 ms at N=4096.
 # - Stage 1 creates large temporary matrices, which adds significant memory traffic.
 # ---------------------------------------------------------
 
@@ -725,8 +725,8 @@ def gemver_numpy_10(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # stages 2 and 4 are single BLAS gemv calls, which are well
 # optimized (single-threaded here, see the *_NUM_THREADS settings). Stage 1
 # builds two full N x N np.outer temporaries and then adds them, which is about
-# 3x the memory traffic of the fused in-place loop. Serves as a ceiling for
-# the serial Numba versions and a floor for the parallel ones.
+# 3x the memory traffic of the fused in-place loop. Ends up slower than naive
+# Numba (Baseline 1): the temporaries cost more than the BLAS calls save.
 
 
 # ---------------------------------------------------------
@@ -735,7 +735,7 @@ def gemver_numpy_10(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
             # combined into one matrix traversal
 # - Keeps row-major stride-1 access and enables fastmath/SIMD.
 # - Stage 4 remains separate because it requires the completed x vector.
-# - Result: 0.153 ms at N=512; 14.2 ms at N=4096.
+# - Result: 0.074 ms at N=512; 13.5 ms at N=4096.
 # - loop fusion removes one full pass over A and reduces memory traffic.
 # ---------------------------------------------------------
 
@@ -776,7 +776,8 @@ def gemver_fused_11(alpha, beta, A, u1, v1, u2, v2, w, x, y, z):
 # - Splits rows among threads while preserving the fused stage 1+2 sweep.
 # - Each thread writes to a private partial x vector to prevent a data race.
 # - Partial vectors are reduced into x; stage 4 is parallelized by row.
-# - Result: 0.140 ms at N=512; 14.2 ms at N=4096, fastest overall/tied at large N.
+# - Result: 0.082 ms at N=512; 9.2 ms at N=4096 with 24 threads, fastest at large N
+#   (7.6 ms with 8 threads in the thread sweep).
 # - Limited scaling shows that extra cores cannot overcome memory-bandwidth limits.
 # ---------------------------------------------------------
 @njit(parallel=True, fastmath=True)
@@ -1111,9 +1112,10 @@ def gemver_fused_unroll_jam_parallel_17(alpha, beta, A, u1, v1, u2, v2, w, x, y,
 #     - constant 0 with LLVM option -hoist-runtime-checks=false: 37 us
 # - Expect: clear gain at N=512 (compute matters), smaller at N=4096
 #   (waiting on DRAM hides most of the scalar slowdown).
-# - Observed (5900X, 17 vs 17b, alternating runs):
-#     - N=512:  0.21 -> 0.18 ms (1.2x)
-#     - N=4096: 1.04x-1.13x (the main table's +-10% noise can hide it)
+# - Observed (5900X, 17 vs 17b, warm timing, 2026-11-18 table):
+#     - N=512:  0.143 -> 0.058 ms (2.5x; A in cache, so the scalar path shows)
+#     - N=4096: 12.5 -> 10.8 ms (1.15x; waiting on DRAM hides most of it)
+#     - (Earlier cold-copy runs showed only 1.2x at N=512: A came from DRAM.)
 # - 17_par was never affected: its row bounds are computed at run time.
 # - Lesson: more compile-time knowledge is not always faster.
 # ---------------------------------------------------------
